@@ -470,6 +470,26 @@ class StandbyPool:
                     self._mark_bucket_status(key, sbx_id, "PAUSED")
         return cooled
 
+    def refresh_standby_tokens_now(self) -> int:
+        """Keep RUNNING standby `gatewayAuth` tokens warm across 30-minute expiry boundaries."""
+        auth_cache = getattr(self._client, "_auth_cache", None)
+        get_or_refresh = getattr(auth_cache, "get_or_refresh", None)
+        if not callable(get_or_refresh):
+            return 0
+        with self._lock:
+            running_ids = [
+                sid
+                for items in self._pool.values()
+                for sid, st in items
+                if st == "RUNNING"
+            ]
+        refreshed = 0
+        for sbx_id in running_ids:
+            with contextlib.suppress(Exception):
+                get_or_refresh(sbx_id)
+                refreshed += 1
+        return refreshed
+
     def _mark_bucket_status(self, key: str, sbx_id: str, new_status: str) -> None:
         with self._lock:
             bucket = self._pool.get(key)
@@ -625,6 +645,8 @@ class StandbyPool:
                         break
                 if not self._stop_event.is_set():
                     self.cool_idle_now()
+                if not self._stop_event.is_set():
+                    self.refresh_standby_tokens_now()
                 if not self._stop_event.is_set():
                     expire_stale_project_snapshots(
                         self._client,

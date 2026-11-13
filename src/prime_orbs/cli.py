@@ -39,19 +39,22 @@ from .images import (
 )
 from .standby import ORB_STANDBY_LABEL
 from .state import SnapshotStore
+from .systemd import (
+    DEFAULT_REFRESH_ON_CALENDAR,
+    activate_systemd_units,
+    ensure_env_file_placeholder,
+    render_systemd_units,
+    write_systemd_units,
+)
+from .transport import create_tuned_clients
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _require_api_client() -> APIClient:
-    client = APIClient()
-    if not client.config.api_key:
-        raise UnauthorizedError(
-            "Missing Prime API key. Export PRIME_API_KEY or run `prime login` first."
-        )
-    return client
+def _require_clients() -> tuple[APIClient, SandboxClient, ImageClient]:
+    return create_tuned_clients(require_api_key=True)
 
 
 def cmd_dispatch(_args: argparse.Namespace) -> int:
@@ -62,8 +65,7 @@ def cmd_dispatch(_args: argparse.Namespace) -> int:
 
 
 def cmd_build_image(args: argparse.Namespace) -> int:
-    api_client = _require_api_client()
-    image_client = ImageClient(api_client)
+    _, sandbox_client, image_client = _require_clients()
 
     arch: OrbArch = "arm64" if args.arch in ("arm64", "arm") else "amd64"
     visibility: ImageVisibility | None = None
@@ -122,7 +124,6 @@ def cmd_build_image(args: argparse.Namespace) -> int:
 
     if args.warm_template:
         config = ProviderConfig.from_env({**os.environ, "ORB_IMAGE": image_ref})
-        sandbox_client = SandboxClient(api_client)
         _, ckpt_id = build_warm_template(
             config,
             sandbox_client=sandbox_client,
@@ -136,9 +137,7 @@ def cmd_build_image(args: argparse.Namespace) -> int:
 
 
 def cmd_warm_template(args: argparse.Namespace) -> int:
-    api_client = _require_api_client()
-    sandbox_client = SandboxClient(api_client)
-    image_client = ImageClient(api_client)
+    _, sandbox_client, image_client = _require_clients()
     config = ProviderConfig.from_env()
 
     key, ckpt_id = build_warm_template(
@@ -154,9 +153,7 @@ def cmd_warm_template(args: argparse.Namespace) -> int:
 
 
 def cmd_status(_args: argparse.Namespace) -> int:
-    api_client = _require_api_client()
-    sandbox_client = SandboxClient(api_client)
-    image_client = ImageClient(api_client)
+    api_client, sandbox_client, image_client = _require_clients()
     config = ProviderConfig.from_env()
     store = SnapshotStore(config.state_dir)
 
@@ -234,8 +231,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 
 def cmd_gc_snapshots(_args: argparse.Namespace) -> int:
-    api_client = _require_api_client()
-    sandbox_client = SandboxClient(api_client)
+    _, sandbox_client, _ = _require_clients()
     config = ProviderConfig.from_env()
     store = SnapshotStore(config.state_dir)
 
@@ -289,9 +285,7 @@ def cmd_gc_snapshots(_args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    api_client = _require_api_client()
-    sandbox_client = SandboxClient(api_client)
-    image_client = ImageClient(api_client)
+    _, sandbox_client, image_client = _require_clients()
     config = ProviderConfig.from_env()
 
     resolved_image = resolve_prime_image(config.default_spec.image, image_client)
@@ -376,6 +370,54 @@ def cmd_run(args: argparse.Namespace) -> int:
                     proc.wait(timeout=5.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+
+
+def cmd_install_service(args: argparse.Namespace) -> int:
+    repo_root = _repo_root()
+    env_file = Path(args.env_file).expanduser()
+    unit_dir = Path(args.unit_dir).expanduser()
+
+    units = render_systemd_units(
+        repo_root=repo_root,
+        env_file=env_file,
+        unit_dir=unit_dir,
+        service_name=args.service_name,
+        standby_count=args.standby_count,
+        include_refresh_timer=not args.no_refresh_timer,
+        refresh_on_calendar=args.refresh_schedule,
+    )
+
+    if args.print_only:
+        print(f"# {units.service_unit_path}\n{units.service_content}")
+        if units.refresh_service_path and units.refresh_service_content:
+            print(f"# {units.refresh_service_path}\n{units.refresh_service_content}")
+        if units.refresh_timer_path and units.refresh_timer_content:
+            print(f"# {units.refresh_timer_path}\n{units.refresh_timer_content}")
+        return 0
+
+    created_placeholder = ensure_env_file_placeholder(env_file)
+    written = write_systemd_units(units)
+    for path in written:
+        print(f"Wrote {path}")
+
+    if created_placeholder:
+        print(
+            f"\nCreated 0600 credentials template at {env_file}.\n"
+            "Fill in PRIME_API_KEY and AMP_ORB_PROVIDER_TOKEN before starting the service."
+        )
+        return 0
+
+    if args.no_enable:
+        print("Skipped `systemctl --user enable --now` (--no-enable).")
+        return 0
+
+    notes = activate_systemd_units(units)
+    print(f"Enabled and started {units.service_name}.service")
+    if units.refresh_timer_path is not None:
+        print(f"Enabled and started {units.refresh_timer_path.name}")
+    for note in notes:
+        print(f"Note: {note}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -527,6 +569,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exec `amp orb provider` directly without the in-memory UNIX-socket daemon",
     )
     sub_run.set_defaults(func=cmd_run)
+
+    sub_install = sub.add_parser(
+        "install-service",
+        help="Write and enable `systemd --user` service + daily warm-template refresh timer",
+    )
+    sub_install.add_argument(
+        "--env-file",
+        default=str(Path.home() / ".config" / "prime-orbs.env"),
+        help="Path to 0600 credentials file (default: ~/.config/prime-orbs.env)",
+    )
+    sub_install.add_argument(
+        "--unit-dir",
+        default=str(Path.home() / ".config" / "systemd" / "user"),
+        help="Systemd user unit directory (default: ~/.config/systemd/user)",
+    )
+    sub_install.add_argument(
+        "--service-name",
+        default="prime-orbs",
+        help="Base systemd unit name (default: prime-orbs)",
+    )
+    sub_install.add_argument(
+        "--standby-count",
+        type=int,
+        default=None,
+        help="Optional --standby-count flag baked into ExecStart",
+    )
+    sub_install.add_argument(
+        "--refresh-schedule",
+        default=DEFAULT_REFRESH_ON_CALENDAR,
+        help=(
+            f"Systemd OnCalendar schedule for warm-template refresh "
+            f"(default: {DEFAULT_REFRESH_ON_CALENDAR})"
+        ),
+    )
+    sub_install.add_argument(
+        "--no-refresh-timer",
+        action="store_true",
+        help="Skip creating the daily warm-template refresh service and timer",
+    )
+    sub_install.add_argument(
+        "--no-enable",
+        action="store_true",
+        help="Write unit files without running `systemctl --user enable --now`",
+    )
+    sub_install.add_argument(
+        "--print-only",
+        action="store_true",
+        help="Print generated systemd unit contents to stdout without writing files",
+    )
+    sub_install.set_defaults(func=cmd_install_service)
 
     return parser
 

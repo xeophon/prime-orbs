@@ -221,7 +221,10 @@ def test_build_orb_image_packages_dockerfile_and_returns_prime_display_ref() -> 
         assert dockerfile_member.read().decode() == (
             f"FROM {DEFAULT_AMP_ORB_IMAGE_X64}\n"
             "USER user\n"
-            "RUN curl -fsSL https://ampcode.com/install.sh | bash\n"
+            "RUN curl -fsSL https://ampcode.com/install.sh | bash \\\n"
+            "    && mkdir -p /home/user/.config/amp \\\n"
+            "    && ([ -f /home/user/.config/amp/settings.json ] "
+            "|| printf '{}\\n' > /home/user/.config/amp/settings.json)\n"
         )
 
     assert isinstance(ImageClient, type)

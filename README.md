@@ -129,8 +129,11 @@ Note: Prime GPU sandboxes do not support VM memory pause; when `ORB_OPERATION=pa
 ## Helper Commands
 
 ```bash
-# Inspect built Prime orb images, active/paused orb sandboxes, and cached snapshots
+# Inspect built Prime orb images, warm templates, standby VMs, active/paused orbs, and snapshots
 uv run prime-orbs status
+
+# Install & enable 24/7 systemd --user service + daily warm-template refresh timer on Linux VPS
+uv run prime-orbs install-service
 
 # Prune expired/deleted checkpoints from the local snapshot mapping store
 uv run prime-orbs gc-snapshots

@@ -449,3 +449,113 @@ def test_long_state_dir_falls_back_to_short_runtime_socket_path() -> None:
     deep_dir = Path("/tmp/" + ("very_long_segment_" * 8))
     sock = daemon_socket_path(deep_dir)
     assert len(str(sock).encode("utf-8")) <= 96
+
+
+def test_tuned_transport_pools_proactive_token_refresh_and_setup_timings(
+    tmp_path: Path,
+) -> None:
+    from prime_sandboxes import APIClient, SandboxClient
+
+    from prime_orbs.cli import main as cli_main
+    from prime_orbs.dispatcher import TEMPLATE_PREWARM_SCRIPT
+    from prime_orbs.transport import (
+        API_KEEPALIVE_EXPIRY_SECONDS,
+        tune_api_client,
+        tune_sandbox_client,
+    )
+
+    # 1. Verify httpx keepalive_expiry is raised from 5.0s -> 300.0s & pyqwest HTTP/2 pool leases
+    api = APIClient(api_key="test-key", require_auth=False)
+    try:
+        tune_api_client(api)
+        assert api.client._transport._pool._keepalive_expiry == API_KEEPALIVE_EXPIRY_SECONDS  # type: ignore[attr-defined]
+        sbx_client = tune_sandbox_client(SandboxClient(api))
+        with sbx_client._command_pool.lease() as leased:
+            assert leased is not None
+    finally:
+        api.client.close()
+
+    # 2. Verify TEMPLATE_PREWARM_SCRIPT creates ~/.config/amp/settings.json only when missing
+    fake_home = tmp_path / "guest_home"
+    fake_home.mkdir()
+    subprocess.run(
+        ["/bin/bash", "-c", TEMPLATE_PREWARM_SCRIPT],
+        env={"HOME": str(fake_home), "PATH": "/usr/bin:/bin", "PRIME_ORB_UPDATE_AMP": "0"},
+        check=True,
+    )
+    settings_path = fake_home / ".config" / "amp" / "settings.json"
+    assert settings_path.read_text(encoding="utf-8") == "{}\n"
+    settings_path.write_text('{"custom": true}\n', encoding="utf-8")
+    subprocess.run(
+        ["/bin/bash", "-c", TEMPLATE_PREWARM_SCRIPT],
+        env={"HOME": str(fake_home), "PATH": "/usr/bin:/bin", "PRIME_ORB_UPDATE_AMP": "0"},
+        check=True,
+    )
+    assert settings_path.read_text(encoding="utf-8") == '{"custom": true}\n'
+
+    # 3. Verify proactive standby token refresh & setup-log timing line
+    state_dir = tmp_path / "timing_state"
+    sock_path = daemon_socket_path(state_dir)
+    backend = FakePrimeBackend()
+    refreshed_ids: list[str] = []
+    backend.get_or_refresh = lambda sid: refreshed_ids.append(sid) or {}  # type: ignore[attr-defined]
+
+    with DispatchDaemon(
+        sock_path,
+        base_env={
+            "PRIME_ORB_STATE_DIR": str(state_dir),
+            "ORB_IMAGE": "prime/xeophon/amp-orb:latest",
+            "PRIME_ORB_STANDBY_COUNT": "1",
+        },
+        sandbox_client=backend,  # type: ignore[arg-type]
+        image_client=_ImageClientAdapter(backend),  # type: ignore[arg-type]
+        enable_standby_worker=False,
+    ) as daemon:
+        hot = daemon.standby_pool.replenish_once()
+        assert hot is not None
+        assert daemon.standby_pool.refresh_standby_tokens_now() == 1
+        assert refreshed_ids == [hot.id]
+
+        repo_root = Path(__file__).resolve().parents[1]
+        proc = subprocess.run(
+            [sys.executable, str(repo_root / "dispatch.py")],
+            env={
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                DAEMON_SOCKET_ENV: str(sock_path),
+                "PRIME_ORB_STATE_DIR": str(state_dir),
+                "ORB_OPERATION": "spawn",
+                "ORB_ID": "amp-timed",
+                "ORB_TOKEN": "tok_timed",
+            },
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "via hot-standby (acquire=" in proc.stderr
+        assert "bootstrap=" in proc.stderr
+
+    # 4. Verify `prime-orbs install-service` writes 0600 env file, service unit, and daily timer
+    env_file = tmp_path / "creds" / "prime-orbs.env"
+    unit_dir = tmp_path / "systemd_user"
+    rc = cli_main(
+        [
+            "install-service",
+            "--env-file",
+            str(env_file),
+            "--unit-dir",
+            str(unit_dir),
+            "--standby-count",
+            "1",
+            "--no-enable",
+        ]
+    )
+    assert rc == 0
+    assert (env_file.stat().st_mode & 0o777) == 0o600
+    svc_text = (unit_dir / "prime-orbs.service").read_text(encoding="utf-8")
+    refresh_svc = (unit_dir / "prime-orbs-refresh.service").read_text(encoding="utf-8")
+    refresh_timer = (unit_dir / "prime-orbs-refresh.timer").read_text(encoding="utf-8")
+    assert "run --warm-template --standby-count 1" in svc_text
+    assert "warm-template" in refresh_svc
+    assert "OnCalendar=" in refresh_timer
+

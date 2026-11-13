@@ -195,7 +195,10 @@ def package_dockerfile_tarball(
             lines.extend(
                 [
                     "USER user",
-                    "RUN curl -fsSL https://ampcode.com/install.sh | bash",
+                    "RUN curl -fsSL https://ampcode.com/install.sh | bash \\",
+                    "    && mkdir -p /home/user/.config/amp \\",
+                    "    && ([ -f /home/user/.config/amp/settings.json ] "
+                    "|| printf '{}\\n' > /home/user/.config/amp/settings.json)",
                 ]
             )
         dockerfile_bytes = ("\n".join(lines) + "\n").encode()

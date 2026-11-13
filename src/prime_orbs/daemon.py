@@ -13,12 +13,13 @@ import threading
 from collections.abc import Mapping
 from pathlib import Path
 
-from prime_sandboxes import APIClient, ImageClient, SandboxClient
+from prime_sandboxes import ImageClient, SandboxClient
 
 from .config import DispatchJob, ProviderConfig
 from .dispatcher import default_log, run_dispatch, sync_known_orbs
 from .standby import SnapshotPromoter, StandbyPool
 from .state import SnapshotStore
+from .transport import create_tuned_clients
 
 DAEMON_SOCKET_ENV = "PRIME_ORBS_DAEMON_SOCKET"
 _FORWARDED_ENV_PREFIXES = ("ORB_", "PRIME_ORB_", "AMP_", "PRIME_", "XDG_")
@@ -55,9 +56,9 @@ class DispatchDaemon:
         self.socket_path = socket_path
         self._base_env = dict(os.environ if base_env is None else base_env)
         if sandbox_client is None or image_client is None:
-            api_client = APIClient()
-            sandbox_client = sandbox_client or SandboxClient(api_client)
-            image_client = image_client or ImageClient(api_client)
+            _, tuned_sbx, tuned_img = create_tuned_clients(require_api_key=False)
+            sandbox_client = sandbox_client or tuned_sbx
+            image_client = image_client or tuned_img
         self.sandbox_client = sandbox_client
         self.image_client = image_client
         self._enable_standby_worker = enable_standby_worker
