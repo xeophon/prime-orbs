@@ -6,6 +6,8 @@ import contextlib
 import hashlib
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from prime_sandboxes import (
@@ -20,11 +22,22 @@ from prime_sandboxes import (
     UnauthorizedError,
 )
 
+try:
+    from prime_sandboxes.sandbox import (
+        _is_retryable_reachability_error as _sdk_is_retryable_reachability_error,
+    )
+except ImportError:  # pragma: no cover
+
+    def _sdk_is_retryable_reachability_error(_exc: BaseException) -> bool:
+        return False
+
+
 from .config import DispatchJob, OrbSpec, ProviderConfig
 from .images import resolve_prime_image
 from .state import SnapshotStore, orb_lock
 
 ORB_MANAGED_LABEL = "amp-orb"
+ORB_TEMPLATE_LABEL = "amp-orb-template"
 TERMINAL_STATUSES = frozenset({"TERMINATED", "TIMEOUT", "ERROR"})
 
 BOOTSTRAP_SCRIPT = """\
@@ -42,6 +55,28 @@ fi
 nohup setsid amp orb bootstrap </dev/null >>"${HOME}/.amp-bootstrap.log" 2>&1 &
 """
 
+TEMPLATE_PREWARM_SCRIPT = """\
+set -euo pipefail
+export HOME="${HOME:-/home/user}"
+export USER="${USER:-user}"
+export LOGNAME="${LOGNAME:-$USER}"
+amp_dirs="$HOME/.amp/bin:/opt/git/bin:$HOME/.local/bin:$HOME/.nix-profile/bin"
+export PATH="$amp_dirs:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+cd "$HOME" 2>/dev/null || cd /
+if [ "${PRIME_ORB_UPDATE_AMP:-1}" = "1" ] && command -v amp >/dev/null 2>&1; then
+  amp update --porcelain || true
+fi
+command -v amp >/dev/null 2>&1 && amp --version >/dev/null 2>&1 || true
+rm -f "${HOME}/.amp-bootstrap.log"
+sync
+"""
+
+LogFn = Callable[[str], None]
+
+
+def default_log(message: str) -> None:
+    print(f"[prime-orbs] {message}", file=sys.stderr, flush=True)
+
 
 def orb_id_label(orb_id: str) -> str:
     return f"amp-orb:{orb_id}"
@@ -54,27 +89,32 @@ def orb_labels(orb_id: str, orb_type: str | None = None) -> list[str]:
     return labels
 
 
-def _log(message: str) -> None:
-    print(f"[prime-orbs] {message}", file=sys.stderr, flush=True)
+def warm_template_key(resolved_image: str, spec: OrbSpec) -> str:
+    arch = spec.arch or "amd64"
+    return (
+        f"{resolved_image}|cpu={spec.cpu_cores:g}|mem={spec.memory_gb:g}"
+        f"|disk={spec.disk_size_gb:g}|arch={arch}"
+    )
 
 
 def _aware_utc(ts: datetime) -> datetime:
     return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
 
 
-def _remaining(deadline: float, *, floor: float = 1.0) -> float:
+def _remaining(deadline: float, *, floor: float = 0.25) -> float:
     left = deadline - time.monotonic()
     if left <= 0:
         raise TimeoutError("Dispatch operation exceeded configured time budget")
     return max(floor, left)
 
 
-def _max_attempts_for_phase_seconds(phase_seconds: float) -> int:
-    # Matches prime_sandboxes._creation_timeout_seconds (_LEGACY_FAST_POLLS = 5).
-    clamped = max(5.0, phase_seconds)
-    if clamped <= 5.0:
-        return 5
-    return max(5, int(5 + (clamped - 5.0) / 2.0))
+def _fast_poll_delay(elapsed: float) -> float:
+    """Poll tightly (250ms) during normal 1-15s boot/resume/pause windows, then ease off."""
+    if elapsed < 15.0:
+        return 0.25
+    if elapsed < 45.0:
+        return 0.5
+    return 1.0
 
 
 def _deterministic_idempotency_key(orb_id: str, generation: int, source_tag: str) -> str:
@@ -88,6 +128,16 @@ def _invalidate_gateway_auth(client: SandboxClient, sandbox_id: str) -> None:
     if callable(invalidate):
         with contextlib.suppress(Exception):
             invalidate(sandbox_id)
+
+
+def _is_waiting_for_image_build(sandbox: Sandbox) -> bool:
+    return sandbox.status == "PENDING" and bool(getattr(sandbox, "pending_image_build_id", None))
+
+
+def _is_retryable_bootstrap_error(exc: BaseException) -> bool:
+    if _sdk_is_retryable_reachability_error(exc):
+        return True
+    return isinstance(exc, (APIError, CommandTimeoutError))
 
 
 def list_sandboxes_for_orb(
@@ -117,12 +167,45 @@ def list_sandboxes_for_orb(
     return active, terminated
 
 
+def _resolve_existing_orb_sandbox(
+    client: SandboxClient,
+    store: SnapshotStore,
+    orb_id: str,
+    log: LogFn,
+) -> tuple[Sandbox | None, list[Sandbox]]:
+    """Fast-path lookup via cached `orb_id -> sandbox_id` (1 GET), falling back to label search."""
+    cached_id = store.get_orb_sandbox(orb_id)
+    if cached_id:
+        try:
+            sbx = client.get(cached_id)
+            if sbx.status not in TERMINAL_STATUSES:
+                return sbx, []
+            store.remove_orb_sandbox(orb_id)
+            return None, [sbx]
+        except APIError as exc:
+            if "HTTP 404" not in str(exc) and "not found" not in str(exc).lower():
+                raise
+            store.remove_orb_sandbox(orb_id)
+
+    active, terminated = list_sandboxes_for_orb(client, orb_id)
+    for extra in active[1:]:
+        log(f"Deleting duplicate active sandbox {extra.id} for {orb_id}")
+        _safe_delete_sandbox(client, extra.id)
+
+    if active:
+        chosen = active[0]
+        store.set_orb_sandbox(orb_id, chosen.id)
+        return chosen, terminated
+    return None, terminated
+
+
 def run_dispatch(
     job: DispatchJob,
     config: ProviderConfig,
     *,
     sandbox_client: SandboxClient | None = None,
     image_client: ImageClient | None = None,
+    log_fn: LogFn = default_log,
 ) -> None:
     """Execute one `spawn`, `pause`, or `delete` job against Prime Sandboxes."""
     deadline = time.monotonic() + config.dispatch_timeout_seconds
@@ -141,11 +224,11 @@ def run_dispatch(
 
     with orb_lock(config.state_dir, job.orb_id, timeout_seconds=_remaining(deadline)):
         if job.operation == "spawn":
-            _handle_spawn(job, config, sandbox_client, image_client, store, deadline)
+            _handle_spawn(job, config, sandbox_client, image_client, store, deadline, log_fn)
         elif job.operation == "pause":
-            _handle_pause(job, config, sandbox_client, store, deadline)
+            _handle_pause(job, config, sandbox_client, store, deadline, log_fn)
         elif job.operation == "delete":
-            _handle_delete(job, sandbox_client, store, deadline)
+            _handle_delete(job, sandbox_client, store, deadline, log_fn)
         else:
             raise ValueError(f"Unsupported operation: {job.operation!r}")
 
@@ -157,26 +240,17 @@ def _handle_spawn(
     image_client: ImageClient,
     store: SnapshotStore,
     deadline: float,
+    log: LogFn,
 ) -> None:
     spec = config.resolve_spec(job)
-    active, terminated = list_sandboxes_for_orb(client, job.orb_id)
-
-    # Clean up any unexpected older duplicate active sandboxes so only the newest remains.
-    for extra in active[1:]:
-        _log(f"Deleting duplicate active sandbox {extra.id} for {job.orb_id}")
-        _safe_delete_sandbox(client, extra.id)
+    candidate, terminated = _resolve_existing_orb_sandbox(client, store, job.orb_id, log)
 
     running_sandbox: Sandbox | None = None
-    if active:
-        candidate = client.get(active[0].id)
-        if candidate.status in TERMINAL_STATUSES:
+    if candidate is not None:
+        running_sandbox = _ensure_existing_running(client, candidate, job.orb_id, deadline, log)
+        if running_sandbox is None:
+            store.remove_orb_sandbox(job.orb_id)
             terminated.insert(0, candidate)
-        else:
-            running_sandbox = _ensure_existing_running(
-                client, candidate, job.orb_id, deadline
-            )
-            if running_sandbox is None:
-                terminated.insert(0, candidate)
 
     if running_sandbox is None:
         running_sandbox = _create_orb_sandbox(
@@ -188,9 +262,11 @@ def _handle_spawn(
             store=store,
             terminated=terminated,
             deadline=deadline,
+            log=log,
         )
+        store.set_orb_sandbox(job.orb_id, running_sandbox.id)
 
-    _launch_bootstrap(client, running_sandbox.id, job, config, deadline)
+    _launch_bootstrap_when_ready(client, running_sandbox.id, job, config, deadline, log)
 
 
 def _ensure_existing_running(
@@ -198,42 +274,74 @@ def _ensure_existing_running(
     sandbox: Sandbox,
     orb_id: str,
     deadline: float,
+    log: LogFn,
 ) -> Sandbox | None:
     """Resume or wait on an existing sandbox; return None only if its node died irrecoverably."""
     if sandbox.status == "PAUSED":
-        _log(f"Resuming paused sandbox {sandbox.id} for {orb_id}")
+        log(f"Resuming paused sandbox {sandbox.id} for {orb_id}")
         try:
-            _resume_until_running(client, sandbox, deadline)
+            return _resume_until_running(client, sandbox, deadline, log)
         except SandboxNotRunningError as exc:
-            _log(
+            log(
                 f"Paused sandbox {sandbox.id} could not resume ({exc}); "
                 "falling back to checkpoint/image recovery"
             )
             return None
-    elif sandbox.status in ("PENDING", "PROVISIONING"):
-        _log(f"Waiting for in-flight sandbox {sandbox.id} ({sandbox.status})")
-
-    _wait_for_gateway_ready(client, sandbox.id, deadline)
+    if sandbox.status in ("PENDING", "PROVISIONING"):
+        log(f"Waiting for in-flight sandbox {sandbox.id} ({sandbox.status})")
+        return _poll_until_running(client, sandbox, deadline)
     return sandbox
+
+
+def _poll_until_running(
+    client: SandboxClient,
+    initial: Sandbox,
+    deadline: float,
+) -> Sandbox:
+    """Poll tightly until `initial` reaches RUNNING (0 extra polls if already RUNNING)."""
+    if initial.status == "RUNNING":
+        return initial
+
+    started = time.monotonic()
+    while True:
+        remaining = _remaining(deadline)
+        current = client.get(initial.id)
+        if current.status == "RUNNING":
+            return current
+        if current.status in TERMINAL_STATUSES:
+            raise SandboxNotRunningError(
+                initial.id,
+                message=(
+                    f"Sandbox entered {current.status} before reaching RUNNING: "
+                    f"{current.error_message or current.termination_reason or 'no details'}"
+                ),
+            )
+        delay = (
+            5.0
+            if _is_waiting_for_image_build(current)
+            else _fast_poll_delay(time.monotonic() - started)
+        )
+        time.sleep(min(delay, remaining))
 
 
 def _resume_until_running(
     client: SandboxClient,
     sandbox: Sandbox,
     deadline: float,
-) -> None:
+    log: LogFn,
+) -> Sandbox:
     accepted = _request_resume_with_retry(client, sandbox.id, deadline)
+    if accepted.status == "RUNNING":
+        return accepted
     baseline_error = accepted.error_message
-    _invalidate_gateway_auth(client, sandbox.id)
 
     retried_after_node_error = False
-    delay = 0.5
+    started = time.monotonic()
     while True:
         remaining = _remaining(deadline)
         current = client.get(sandbox.id)
         if current.status == "RUNNING":
-            _invalidate_gateway_auth(client, sandbox.id)
-            return
+            return current
         if current.status in TERMINAL_STATUSES:
             raise SandboxNotRunningError(
                 sandbox.id,
@@ -249,22 +357,23 @@ def _resume_until_running(
         ):
             if not retried_after_node_error:
                 retried_after_node_error = True
-                _log(f"Resume reported error ({current.error_message}); retrying once")
+                log(f"Resume reported error ({current.error_message}); retrying once")
                 accepted_retry = _request_resume_with_retry(client, sandbox.id, deadline)
+                if accepted_retry.status == "RUNNING":
+                    return accepted_retry
                 baseline_error = accepted_retry.error_message
             else:
                 raise RuntimeError(
                     f"Failed to resume paused sandbox {sandbox.id}: {current.error_message}"
                 )
-        time.sleep(min(delay, remaining))
-        delay = min(delay * 1.5, 3.0)
+        time.sleep(min(_fast_poll_delay(time.monotonic() - started), remaining))
 
 
 def _request_resume_with_retry(
     client: SandboxClient, sandbox_id: str, deadline: float
 ) -> Sandbox:
-    delay = 0.5
-    for attempt in range(5):
+    delay = 0.25
+    for attempt in range(6):
         try:
             return client.resume(sandbox_id)
         except APIError as exc:
@@ -272,26 +381,12 @@ def _request_resume_with_retry(
             is_conflict_or_5xx = any(
                 code in msg for code in ("HTTP 409", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")
             )
-            if not is_conflict_or_5xx or attempt == 4:
+            if not is_conflict_or_5xx or attempt == 5:
                 raise
             remaining = _remaining(deadline)
             time.sleep(min(delay, remaining))
-            delay = min(delay * 2.0, 4.0)
+            delay = min(delay * 2.0, 2.0)
     raise AssertionError("unreachable")
-
-
-def _wait_for_gateway_ready(
-    client: SandboxClient, sandbox_id: str, deadline: float
-) -> None:
-    remaining = _remaining(deadline, floor=10.0)
-    phase_seconds = max(10.0, remaining / 2.0)
-    max_attempts = _max_attempts_for_phase_seconds(phase_seconds)
-    image_build_budget = max(10, int(remaining - 15.0))
-    client.wait_for_creation(
-        sandbox_id,
-        max_attempts=max_attempts,
-        image_build_timeout_seconds=image_build_budget,
-    )
 
 
 def _get_durable_checkpoint_id(client: SandboxClient, checkpoint_id: str) -> str | None:
@@ -337,14 +432,12 @@ def _build_create_request(
     generation: int,
     docker_image: str | None = None,
     checkpoint_id: str | None = None,
+    restore_memory: bool = False,
 ) -> CreateSandboxRequest:
-    source_tag = f"ckpt:{checkpoint_id}" if checkpoint_id else f"img:{docker_image}"
-    common = dict(
+    mode_tag = "mem" if restore_memory else "disk"
+    source_tag = f"ckpt:{mode_tag}:{checkpoint_id}" if checkpoint_id else f"img:{docker_image}"
+    metadata_kwargs = dict(
         name=orb_id,
-        cpu_cores=spec.cpu_cores,
-        memory_gb=spec.memory_gb,
-        gpu_count=spec.gpu_count,
-        gpu_type=spec.gpu_type,
         timeout_minutes=spec.timeout_minutes,
         idle_timeout_minutes=spec.idle_timeout_minutes,
         region=spec.region,
@@ -353,14 +446,32 @@ def _build_create_request(
         labels=orb_labels(orb_id, orb_type),
         idempotency_key=_deterministic_idempotency_key(orb_id, generation, source_tag),
     )
+    if checkpoint_id is not None and restore_memory:
+        # Memory restores inherit cpu_cores, memory_gb, gpu_count, gpu_type, disk, and arch
+        # directly from the paused template VM; leave those fields unset on the model.
+        return CreateSandboxRequest(
+            checkpoint_id=checkpoint_id,
+            restore_memory=True,
+            **metadata_kwargs,
+        )
+    shape_kwargs = dict(
+        cpu_cores=spec.cpu_cores,
+        memory_gb=spec.memory_gb,
+        gpu_count=spec.gpu_count,
+        gpu_type=spec.gpu_type,
+    )
     if checkpoint_id is not None:
-        # Prime checkpoint restores take image, disk_size_gb, and arch from the checkpoint.
-        return CreateSandboxRequest(checkpoint_id=checkpoint_id, **common)
+        return CreateSandboxRequest(
+            checkpoint_id=checkpoint_id,
+            **shape_kwargs,
+            **metadata_kwargs,
+        )
     return CreateSandboxRequest(
         docker_image=docker_image,
         arch=spec.arch,
         disk_size_gb=spec.disk_size_gb,
-        **common,
+        **shape_kwargs,
+        **metadata_kwargs,
     )
 
 
@@ -374,13 +485,14 @@ def _create_orb_sandbox(
     store: SnapshotStore,
     terminated: list[Sandbox],
     deadline: float,
+    log: LogFn,
 ) -> Sandbox:
     generation = len(terminated)
 
     # 1. Recover this orb's disk if a previous sandbox was checkpointed (GPU pause or lost node).
     recovery_ckpt = _find_orb_recovery_checkpoint(client, store, job.orb_id, terminated)
     if recovery_ckpt:
-        _log(f"Restoring {job.orb_id} from orb checkpoint {recovery_ckpt}")
+        log(f"Restoring {job.orb_id} from orb checkpoint {recovery_ckpt}")
         try:
             created = client.create(
                 _build_create_request(
@@ -391,50 +503,66 @@ def _create_orb_sandbox(
                     checkpoint_id=recovery_ckpt,
                 )
             )
-            _wait_for_gateway_ready(client, created.id, deadline)
-            return created
+            return _poll_until_running(client, created, deadline)
         except APIError as exc:
-            _log(f"Orb checkpoint {recovery_ckpt} restore failed ({exc}); falling back")
+            log(f"Orb checkpoint {recovery_ckpt} restore failed ({exc}); falling back")
             store.remove_orb_checkpoint(job.orb_id)
 
     # 2. Boot from shared Amp project snapshot (ORB_SNAPSHOT_ID) when available.
     if config.snapshots_enabled and job.orb_snapshot_id:
         mapped_ckpt = store.get_project_snapshot(job.orb_snapshot_id)
         if mapped_ckpt:
-            durable = _get_durable_checkpoint_id(client, mapped_ckpt)
-            if durable is None:
-                _log(
-                    f"Pruning expired/missing project snapshot "
-                    f"{job.orb_snapshot_id} -> {mapped_ckpt}"
+            log(
+                f"Creating {job.orb_id} from project snapshot "
+                f"{job.orb_snapshot_id} (checkpoint {mapped_ckpt})"
+            )
+            try:
+                created = client.create(
+                    _build_create_request(
+                        orb_id=job.orb_id,
+                        orb_type=job.orb_type,
+                        spec=spec,
+                        generation=generation,
+                        checkpoint_id=mapped_ckpt,
+                    )
+                )
+                return _poll_until_running(client, created, deadline)
+            except APIError as exc:
+                log(
+                    f"Project snapshot {job.orb_snapshot_id} restore failed ({exc}); "
+                    "pruning and falling back"
                 )
                 store.remove_project_snapshot(job.orb_snapshot_id)
-            else:
-                _log(
-                    f"Creating {job.orb_id} from project snapshot "
-                    f"{job.orb_snapshot_id} (checkpoint {durable})"
-                )
-                try:
-                    created = client.create(
-                        _build_create_request(
-                            orb_id=job.orb_id,
-                            orb_type=job.orb_type,
-                            spec=spec,
-                            generation=generation,
-                            checkpoint_id=durable,
-                        )
-                    )
-                    _wait_for_gateway_ready(client, created.id, deadline)
-                    return created
-                except APIError as exc:
-                    _log(
-                        f"Project snapshot {job.orb_snapshot_id} restore failed ({exc}); "
-                        "falling back to base image"
-                    )
-                    store.remove_project_snapshot(job.orb_snapshot_id)
 
-    # 3. Cold boot from resolved Prime/Docker Hub image.
     resolved_image = resolve_prime_image(spec.image, image_client, deadline=deadline)
-    _log(
+
+    # 3. Fork from a pre-booted warm memory checkpoint (`restore_memory=True`) when available.
+    if config.warm_template_enabled and spec.gpu_count == 0:
+        tmpl_key = warm_template_key(resolved_image, spec)
+        warm_ckpt = store.get_warm_template(tmpl_key)
+        if warm_ckpt:
+            log(f"Forking {job.orb_id} from warm memory checkpoint {warm_ckpt}")
+            try:
+                created = client.create(
+                    _build_create_request(
+                        orb_id=job.orb_id,
+                        orb_type=job.orb_type,
+                        spec=spec,
+                        generation=generation,
+                        checkpoint_id=warm_ckpt,
+                        restore_memory=True,
+                    )
+                )
+                return _poll_until_running(client, created, deadline)
+            except APIError as exc:
+                log(
+                    f"Warm memory checkpoint {warm_ckpt} fork failed ({exc}); "
+                    "pruning and cold-booting from image"
+                )
+                store.remove_warm_template(tmpl_key)
+
+    # 4. Cold boot from resolved Prime/Docker Hub image.
+    log(
         f"Creating {job.orb_id} from image {resolved_image} "
         f"({spec.cpu_cores:g} vCPU, {spec.memory_gb:g} GiB RAM, {spec.disk_size_gb:g} GiB disk)"
     )
@@ -447,51 +575,205 @@ def _create_orb_sandbox(
             docker_image=resolved_image,
         )
     )
-    _wait_for_gateway_ready(client, created.id, deadline)
-    return created
+    return _poll_until_running(client, created, deadline)
 
 
-def _launch_bootstrap(
+def _execute_when_gateway_ready(
+    client: SandboxClient,
+    sandbox_id: str,
+    script: str,
+    *,
+    envs: dict[str, str] | None,
+    user: str | None,
+    deadline: float,
+    action_label: str,
+) -> None:
+    """Run `script` as soon as the guest gateway registers, without a throwaway echo RPC."""
+    started = time.monotonic()
+    last_error: BaseException | None = None
+    attempt = 0
+
+    while True:
+        remaining = _remaining(deadline)
+        cmd_timeout = max(5, min(30, int(remaining)))
+        try:
+            result = client.execute_command(
+                sandbox_id,
+                script,
+                working_dir="/",
+                env=envs,
+                timeout=cmd_timeout,
+                user=user,
+            )
+            if result.exit_code != 0:
+                detail = (result.stderr or result.stdout).strip()
+                raise RuntimeError(
+                    f"{action_label} failed in sandbox {sandbox_id} "
+                    f"(exit {result.exit_code}): {detail}"
+                )
+            return
+        except BaseException as exc:
+            if not _is_retryable_bootstrap_error(exc):
+                raise
+            last_error = exc
+            attempt += 1
+            if (deadline - time.monotonic()) <= 0.25:
+                break
+            # After the first missed attempt on a resumed sandbox, refresh gateway coordinates.
+            if attempt >= 2:
+                _invalidate_gateway_auth(client, sandbox_id)
+                with contextlib.suppress(APIError):
+                    sbx = client.get(sandbox_id)
+                    if sbx.status in TERMINAL_STATUSES:
+                        raise SandboxNotRunningError(
+                            sandbox_id,
+                            message=(
+                                f"Sandbox entered {sbx.status} before {action_label}: "
+                                f"{sbx.error_message or sbx.termination_reason or 'no details'}"
+                            ),
+                        ) from exc
+            delay = _fast_poll_delay(time.monotonic() - started)
+            time.sleep(min(delay, _remaining(deadline)))
+
+    assert last_error is not None
+    raise last_error
+
+
+def _launch_bootstrap_when_ready(
     client: SandboxClient,
     sandbox_id: str,
     job: DispatchJob,
     config: ProviderConfig,
     deadline: float,
+    log: LogFn,
 ) -> None:
     assert job.orb_token is not None
     envs: dict[str, str] = {"ORB_TOKEN": job.orb_token}
     if job.amp_url:
         envs["AMP_URL"] = job.amp_url
 
-    last_error: Exception | None = None
-    for attempt in range(3):
-        cmd_timeout = max(10, min(30, int(_remaining(deadline, floor=10.0))))
-        try:
-            result = client.execute_command(
-                sandbox_id,
-                BOOTSTRAP_SCRIPT,
-                working_dir="/",
-                env=envs,
-                timeout=cmd_timeout,
-                user=config.orb_user,
-            )
-            if result.exit_code != 0:
-                detail = (result.stderr or result.stdout).strip()
-                raise RuntimeError(
-                    f"`amp orb bootstrap` failed in sandbox {sandbox_id} "
-                    f"(exit {result.exit_code}): {detail}"
-                )
-            _log(f"Started `amp orb bootstrap` in sandbox {sandbox_id}")
-            return
-        except (APIError, CommandTimeoutError) as exc:
-            last_error = exc
-            if attempt == 2:
-                break
-            _invalidate_gateway_auth(client, sandbox_id)
-            time.sleep(min(1.0 * (2**attempt), _remaining(deadline)))
+    _execute_when_gateway_ready(
+        client,
+        sandbox_id,
+        BOOTSTRAP_SCRIPT,
+        envs=envs,
+        user=config.orb_user,
+        deadline=deadline,
+        action_label="`amp orb bootstrap`",
+    )
+    log(f"Started `amp orb bootstrap` in sandbox {sandbox_id}")
 
-    assert last_error is not None
-    raise last_error
+
+def build_warm_template(
+    config: ProviderConfig,
+    *,
+    sandbox_client: SandboxClient,
+    image_client: ImageClient,
+    orb_type: str | None = None,
+    update_amp_cli: bool = True,
+    timeout_seconds: float = 600.0,
+    log_fn: LogFn = default_log,
+) -> tuple[str, str]:
+    """Boot a clean orb VM, prewarm `amp` in guest RAM, pause it, and store its memory checkpoint.
+
+    Returns `(template_key, durable_checkpoint_id)`. The temporary VM is deleted once its
+    pause checkpoint is DURABLE, leaving zero running compute.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    synthetic_job = DispatchJob(
+        operation="spawn",
+        orb_id="amp-warm-template",
+        orb_token="unused",
+        orb_type=orb_type,
+    )
+    spec = config.resolve_spec(synthetic_job)
+    if spec.gpu_count > 0:
+        raise ValueError(
+            "GPU orb types cannot build memory-fork templates (Prime cannot pause GPUs)"
+        )
+
+    resolved_image = resolve_prime_image(spec.image, image_client, deadline=deadline)
+    key = warm_template_key(resolved_image, spec)
+    store = SnapshotStore(config.state_dir)
+
+    template_name = f"amp-orb-template-{int(time.time())}"
+    log_fn(
+        f"Booting clean template VM ({spec.cpu_cores:g} vCPU, {spec.memory_gb:g} GiB RAM, "
+        f"{spec.disk_size_gb:g} GiB disk) from {resolved_image} ..."
+    )
+    template_spec = replace(spec, timeout_minutes=30, idle_timeout_minutes=None)
+    created = sandbox_client.create(
+        CreateSandboxRequest(
+            name=template_name,
+            docker_image=resolved_image,
+            arch=template_spec.arch,
+            cpu_cores=template_spec.cpu_cores,
+            memory_gb=template_spec.memory_gb,
+            disk_size_gb=template_spec.disk_size_gb,
+            timeout_minutes=30,
+            region=template_spec.region,
+            labels=[ORB_TEMPLATE_LABEL],
+        )
+    )
+    try:
+        _poll_until_running(sandbox_client, created, deadline)
+        log_fn(f"Prewarming Amp CLI inside template VM {created.id} ...")
+        _execute_when_gateway_ready(
+            sandbox_client,
+            created.id,
+            TEMPLATE_PREWARM_SCRIPT,
+            envs={"PRIME_ORB_UPDATE_AMP": "1" if update_amp_cli else "0"},
+            user=config.orb_user,
+            deadline=deadline,
+            action_label="template prewarm",
+        )
+
+        log_fn(f"Freezing memory checkpoint on template VM {created.id} ...")
+        paused = sandbox_client.pause(created.id)
+        _poll_until_paused(sandbox_client, created.id, paused.error_message, deadline)
+        durable = sandbox_client.wait_for_checkpoint(
+            paused.checkpoint_id, timeout_seconds=_remaining(deadline, floor=5.0)
+        )
+    finally:
+        with contextlib.suppress(APIError):
+            sandbox_client.delete(created.id)
+
+    previous_ckpt = store.set_warm_template(key, durable.id)
+    if previous_ckpt and previous_ckpt != durable.id:
+        protected = set(store.all_project_snapshots().values()) | set(
+            store.all_warm_templates().values()
+        )
+        if previous_ckpt not in protected:
+            _safe_delete_checkpoint(sandbox_client, previous_ckpt, deadline)
+
+    log_fn(f"Saved warm memory checkpoint {durable.id} for {key}")
+    return key, durable.id
+
+
+def _poll_until_paused(
+    client: SandboxClient,
+    sandbox_id: str,
+    prior_error: str | None,
+    deadline: float,
+) -> None:
+    started = time.monotonic()
+    while True:
+        remaining = _remaining(deadline)
+        current = client.get(sandbox_id)
+        if current.status == "PAUSED":
+            return
+        if current.status in TERMINAL_STATUSES:
+            raise RuntimeError(
+                f"Sandbox {sandbox_id} entered {current.status} while pausing: "
+                f"{current.error_message or current.termination_reason or 'no details'}"
+            )
+        if (
+            current.status == "RUNNING"
+            and current.error_message
+            and current.error_message != prior_error
+        ):
+            raise RuntimeError(f"Pause failed for sandbox {sandbox_id}: {current.error_message}")
+        time.sleep(min(_fast_poll_delay(time.monotonic() - started), remaining))
 
 
 def _handle_pause(
@@ -500,19 +782,15 @@ def _handle_pause(
     client: SandboxClient,
     store: SnapshotStore,
     deadline: float,
+    log: LogFn,
 ) -> None:
-    active, _ = list_sandboxes_for_orb(client, job.orb_id)
-    if not active:
-        _log(f"No active sandbox for {job.orb_id}; pause is a no-op")
-        return
-
-    sandbox = client.get(active[0].id)
-    if sandbox.status in TERMINAL_STATUSES:
+    sandbox, _ = _resolve_existing_orb_sandbox(client, store, job.orb_id, log)
+    if sandbox is None:
+        log(f"No active sandbox for {job.orb_id}; pause is a no-op")
         return
 
     if sandbox.status in ("PENDING", "PROVISIONING"):
-        _wait_for_gateway_ready(client, sandbox.id, deadline)
-        sandbox = client.get(sandbox.id)
+        sandbox = _poll_until_running(client, sandbox, deadline)
 
     created_snapshot_ckpt_id: str | None = None
     if config.snapshots_enabled and job.orb_snapshot_id:
@@ -520,9 +798,7 @@ def _handle_pause(
         if existing_snap and _get_durable_checkpoint_id(client, existing_snap):
             created_snapshot_ckpt_id = existing_snap
         elif sandbox.status == "RUNNING":
-            _log(
-                f"Creating project snapshot {job.orb_snapshot_id} from sandbox {sandbox.id}"
-            )
+            log(f"Creating project snapshot {job.orb_snapshot_id} from sandbox {sandbox.id}")
             ckpt = client.checkpoint(sandbox.id, ttl_seconds=config.snapshot_ttl_seconds)
             durable = client.wait_for_checkpoint(
                 ckpt.id, timeout_seconds=_remaining(deadline, floor=5.0)
@@ -551,6 +827,7 @@ def _handle_pause(
             orb_id=job.orb_id,
             reusable_checkpoint_id=created_snapshot_ckpt_id,
             deadline=deadline,
+            log=log,
         )
         return
 
@@ -558,7 +835,7 @@ def _handle_pause(
         paused = client.pause(sandbox.id)
     except APIError as exc:
         if _is_pause_unsupported_error(exc):
-            _log(
+            log(
                 f"VM pause unsupported for sandbox {sandbox.id} ({exc}); "
                 "falling back to filesystem checkpoint + delete"
             )
@@ -569,37 +846,16 @@ def _handle_pause(
                 orb_id=job.orb_id,
                 reusable_checkpoint_id=created_snapshot_ckpt_id,
                 deadline=deadline,
+                log=log,
             )
             return
         raise
 
-    prior_error = paused.error_message
-
     if getattr(paused, "checkpoint_id", None):
         store.set_orb_checkpoint(job.orb_id, paused.checkpoint_id)
 
-    delay = 0.5
-    while True:
-        remaining = _remaining(deadline)
-        current = client.get(sandbox.id)
-        if current.status == "PAUSED":
-            _log(f"Paused sandbox {sandbox.id} for {job.orb_id}")
-            return
-        if current.status in TERMINAL_STATUSES:
-            raise RuntimeError(
-                f"Sandbox {sandbox.id} entered {current.status} while pausing: "
-                f"{current.error_message or current.termination_reason or 'no details'}"
-            )
-        if (
-            current.status == "RUNNING"
-            and current.error_message
-            and current.error_message != prior_error
-        ):
-            raise RuntimeError(
-                f"Pause failed for sandbox {sandbox.id}: {current.error_message}"
-            )
-        time.sleep(min(delay, remaining))
-        delay = min(delay * 1.5, 3.0)
+    _poll_until_paused(client, sandbox.id, paused.error_message, deadline)
+    log(f"Paused sandbox {sandbox.id} for {job.orb_id}")
 
 
 def _is_pause_unsupported_error(exc: APIError) -> bool:
@@ -618,15 +874,16 @@ def _checkpoint_and_delete_for_pause(
     orb_id: str,
     reusable_checkpoint_id: str | None,
     deadline: float,
+    log: LogFn,
 ) -> None:
-    # Project snapshots carry an expiry TTL; create a non-expiring checkpoint for this orb's disk.
     ckpt = client.checkpoint(sandbox.id, ttl_seconds=None)
     durable = client.wait_for_checkpoint(
         ckpt.id, timeout_seconds=_remaining(deadline, floor=5.0)
     )
     store.set_orb_checkpoint(orb_id, durable.id)
+    store.remove_orb_sandbox(orb_id)
     _safe_delete_sandbox(client, sandbox.id)
-    _log(
+    log(
         f"Checkpointed ({durable.id}) and terminated non-pausable sandbox {sandbox.id} "
         f"(reusable snapshot={reusable_checkpoint_id})"
     )
@@ -637,15 +894,28 @@ def _handle_delete(
     client: SandboxClient,
     store: SnapshotStore,
     deadline: float,
+    log: LogFn,
 ) -> None:
     active, terminated = list_sandboxes_for_orb(client, job.orb_id)
+    cached_id = store.get_orb_sandbox(job.orb_id)
+    known_ids = {s.id for s in active} | {s.id for s in terminated}
+    if cached_id and cached_id not in known_ids:
+        with contextlib.suppress(APIError):
+            sbx = client.get(cached_id)
+            if sbx.status in TERMINAL_STATUSES:
+                terminated.append(sbx)
+            else:
+                active.append(sbx)
+
     all_sandboxes = [*active, *terminated]
 
     for sbx in active:
-        _log(f"Deleting sandbox {sbx.id} for {job.orb_id}")
+        log(f"Deleting sandbox {sbx.id} for {job.orb_id}")
         _safe_delete_sandbox(client, sbx.id)
 
-    protected_checkpoints = set(store.all_project_snapshots().values())
+    protected_checkpoints = set(store.all_project_snapshots().values()) | set(
+        store.all_warm_templates().values()
+    )
     candidate_checkpoint_ids: set[str] = set()
 
     recorded_orb_ckpt = store.get_orb_checkpoint(job.orb_id)
@@ -664,6 +934,7 @@ def _handle_delete(
         _safe_delete_checkpoint(client, ckpt_id, deadline)
 
     store.remove_orb_checkpoint(job.orb_id)
+    store.remove_orb_sandbox(job.orb_id)
 
 
 def _safe_delete_sandbox(client: SandboxClient, sandbox_id: str) -> None:
@@ -678,7 +949,7 @@ def _safe_delete_sandbox(client: SandboxClient, sandbox_id: str) -> None:
 def _safe_delete_checkpoint(
     client: SandboxClient, checkpoint_id: str, deadline: float
 ) -> None:
-    delay = 0.5
+    delay = 0.25
     for attempt in range(4):
         try:
             client.delete_checkpoint(checkpoint_id)
@@ -691,5 +962,5 @@ def _safe_delete_checkpoint(
                 time.sleep(delay)
                 delay *= 2.0
                 continue
-            _log(f"Warning: could not delete checkpoint {checkpoint_id}: {exc}")
+            default_log(f"Warning: could not delete checkpoint {checkpoint_id}: {exc}")
             return

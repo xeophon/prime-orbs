@@ -218,6 +218,10 @@ def test_build_orb_image_packages_dockerfile_and_returns_prime_display_ref() -> 
     with tarfile.open(fileobj=io.BytesIO(uploaded_archives[0]), mode="r:gz") as tar:
         dockerfile_member = tar.extractfile("Dockerfile")
         assert dockerfile_member is not None
-        assert dockerfile_member.read().decode() == f"FROM {DEFAULT_AMP_ORB_IMAGE_X64}\n"
+        assert dockerfile_member.read().decode() == (
+            f"FROM {DEFAULT_AMP_ORB_IMAGE_X64}\n"
+            "USER user\n"
+            "RUN curl -fsSL https://ampcode.com/install.sh | bash\n"
+        )
 
     assert isinstance(ImageClient, type)

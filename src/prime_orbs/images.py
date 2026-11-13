@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import io
 import tarfile
+import threading
 import time
+import weakref
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from prime_sandboxes import (
@@ -29,6 +31,11 @@ _IN_PROGRESS_BUILD_STATUSES = {
     ImageBuildStatus.BUILDING,
 }
 _TERMINAL_BUILD_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
+_IMAGE_CACHE_TTL_SECONDS = 300.0
+_IMAGE_CACHE_LOCK = threading.Lock()
+_RESOLVED_IMAGE_CACHE: weakref.WeakKeyDictionary[
+    Any, dict[tuple[str | None, str], tuple[str, float]]
+] = weakref.WeakKeyDictionary()
 
 
 class ImageResolutionError(RuntimeError):
@@ -112,6 +119,18 @@ def resolve_prime_image(
     if is_directly_bootable_image(requested_image):
         return requested_image.strip()
 
+    cache_scope = team_id or getattr(
+        getattr(getattr(image_client, "client", None), "config", None), "team_id", None
+    )
+    cache_key = (cache_scope, requested_image.strip())
+    now = time.monotonic()
+    with _IMAGE_CACHE_LOCK:
+        per_client = _RESOLVED_IMAGE_CACHE.get(image_client)
+        if per_client is not None:
+            cached = per_client.get(cache_key)
+            if cached is not None and cached[1] > now:
+                return cached[0]
+
     image_name, image_tag = parse_name_and_tag(requested_image)
 
     while True:
@@ -123,6 +142,12 @@ def resolve_prime_image(
         if latest.status == ImageBuildStatus.COMPLETED:
             resolved = format_prime_image_ref(latest)
             if resolved.startswith("prime/"):
+                with _IMAGE_CACHE_LOCK:
+                    client_cache = _RESOLVED_IMAGE_CACHE.setdefault(image_client, {})
+                    client_cache[cache_key] = (
+                        resolved,
+                        time.monotonic() + _IMAGE_CACHE_TTL_SECONDS,
+                    )
                 return resolved
             break
         if latest.status in _IN_PROGRESS_BUILD_STATUSES and deadline is not None:
@@ -159,12 +184,21 @@ def package_dockerfile_tarball(
     base_image: str | None = None,
     dockerfile_path: Path | None = None,
     context_dir: Path | None = None,
+    update_amp_cli: bool = True,
 ) -> bytes:
     """Create a gzipped tar archive suitable for Prime's `/images/build` upload URL."""
     if dockerfile_path is not None:
         dockerfile_bytes = dockerfile_path.read_bytes()
     elif base_image is not None:
-        dockerfile_bytes = f"FROM {base_image.strip()}\n".encode()
+        lines = [f"FROM {base_image.strip()}"]
+        if update_amp_cli:
+            lines.extend(
+                [
+                    "USER user",
+                    "RUN curl -fsSL https://ampcode.com/install.sh | bash",
+                ]
+            )
+        dockerfile_bytes = ("\n".join(lines) + "\n").encode()
     else:
         raise ValueError("Either base_image or dockerfile_path must be provided")
 
@@ -198,6 +232,7 @@ def build_orb_image(
     visibility: ImageVisibility | None = None,
     team_id: str | None = None,
     registry_auth: RegistryAuth | None = None,
+    update_amp_cli: bool = True,
     wait: bool = True,
     timeout_seconds: float = 1800.0,
     poll_interval_seconds: float = 10.0,
@@ -215,6 +250,7 @@ def build_orb_image(
         base_image=None if dockerfile_path is not None else effective_base,
         dockerfile_path=dockerfile_path,
         context_dir=context_dir,
+        update_amp_cli=update_amp_cli,
     )
 
     platform: Literal["linux/amd64", "linux/arm64"] = (

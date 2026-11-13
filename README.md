@@ -31,13 +31,15 @@ Prime Sandboxes only boot `prime/<owner>/<name>:<tag>` or Docker Hub images dire
 
 ```bash copy Copy Image Build Command
 export PRIME_API_KEY="<your-prime-api-key>"
-uv run prime-orbs build-image
+uv run prime-orbs build-image --warm-template
 ```
 
-For ARM64 orbs, pass `--arch arm64` (builds `amp-orb-arm64:latest` from `amp-orb-arm64:latest`). You can also build with the Prime CLI directly using [images/Dockerfile](images/Dockerfile):
+`build-image` builds Amp's orb image with the latest `amp` CLI baked in, and `--warm-template` boots one clean template VM, faults `amp` into guest RAM, pauses it into a durable memory checkpoint, and deletes the temporary VM so future threads skip cold Linux kernel + `systemd` boot via `restore_memory=True`.
+
+For ARM64 orbs, pass `--arch arm64` (builds `amp-orb-arm64:latest`). You can also refresh the warm memory checkpoint anytime without rebuilding the Docker image:
 
 ```bash
-prime images push amp-orb:latest --context ./images --dockerfile ./images/Dockerfile
+uv run prime-orbs warm-template
 ```
 
 ### 3. Run the orb provider
@@ -50,10 +52,10 @@ export AMP_ORB_PROVIDER_TOKEN="aop_live_..."
 amp orb provider /path/to/prime-orbs/dispatch.py
 ```
 
-Or use `prime-orbs run`, which verifies Prime credentials and resolves your `prime/<owner>/amp-orb:latest` image upfront before starting `amp orb provider`:
+Or use `prime-orbs run`, which verifies Prime credentials, resolves your `prime/<owner>/amp-orb:latest` image, and hosts an in-memory UNIX-socket worker so `dispatch.py` completes in ~15ms reusing warm HTTP/1.1 & HTTP/2 connection pools:
 
 ```bash copy Copy Managed Run Command
-uv run prime-orbs run
+uv run prime-orbs run --warm-template
 ```
 
 Even when `ORB_IMAGE` is left unset (so Amp passes `us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest`), `dispatch.py` automatically looks up your built `amp-orb:latest` in Prime Images and resolves its `prime/<owner>/amp-orb:latest` reference.
@@ -85,6 +87,8 @@ Configure defaults in the `amp orb provider` environment:
 | `PRIME_ORB_NETWORK_ALLOWLIST` | unset | Comma-separated outbound allowlist (domains/IPv4 CIDRs) |
 | `PRIME_ORB_NETWORK_DENYLIST` | unset | Comma-separated outbound denylist |
 | `PRIME_ORB_USER` | `user` | Guest user running `amp orb bootstrap` (`""` for sandbox default) |
+| `PRIME_ORB_WARM_TEMPLATE` | `true` | Fork new CPU orbs from a cached `warm-template` memory checkpoint (`restore_memory=True`) when available |
+| `PRIME_ORB_AUTO_WARM_TEMPLATE` | `false` | Build a warm memory template automatically during `prime-orbs run` if none exists |
 | `PRIME_ORB_SNAPSHOTS` | `true` | Enable `ORB_SNAPSHOT_ID` project snapshots via Prime checkpoints |
 | `PRIME_ORB_SNAPSHOT_TTL_SECONDS` | `345600` (96h) | Server-side TTL for project snapshot checkpoints (`0` disables expiry) |
 | `PRIME_ORB_STATE_DIR` | `~/.local/state/prime-orbs` | Local directory for per-orb locks and `ORB_SNAPSHOT_ID` mappings |

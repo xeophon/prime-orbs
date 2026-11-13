@@ -149,6 +149,8 @@ class ProviderConfig:
     snapshot_ttl_seconds: int | None
     dispatch_timeout_seconds: float
     prime_orb_image_override: str | None = None
+    warm_template_enabled: bool = True
+    auto_warm_template: bool = False
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ProviderConfig:
@@ -212,6 +214,8 @@ class ProviderConfig:
             state_dir = base_state / "prime-orbs"
 
         snapshots_enabled = _parse_bool(env.get("PRIME_ORB_SNAPSHOTS"), default=True)
+        warm_template_enabled = _parse_bool(env.get("PRIME_ORB_WARM_TEMPLATE"), default=True)
+        auto_warm_template = _parse_bool(env.get("PRIME_ORB_AUTO_WARM_TEMPLATE"), default=False)
         ttl_raw = _parse_int(env, "PRIME_ORB_SNAPSHOT_TTL_SECONDS", DEFAULT_SNAPSHOT_TTL_SECONDS)
         snapshot_ttl_seconds = ttl_raw if ttl_raw > 0 else None
 
@@ -230,6 +234,8 @@ class ProviderConfig:
             snapshot_ttl_seconds=snapshot_ttl_seconds,
             dispatch_timeout_seconds=dispatch_timeout_seconds,
             prime_orb_image_override=prime_image_override,
+            warm_template_enabled=warm_template_enabled,
+            auto_warm_template=auto_warm_template,
         )
 
     def resolve_spec(self, job: DispatchJob) -> OrbSpec:

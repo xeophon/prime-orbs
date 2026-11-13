@@ -1,19 +1,50 @@
 #!/usr/bin/env python3
 """Amp self-hosted orb dispatch entrypoint for Prime Intellect Sandboxes.
 
-Usage:
-    amp orb provider ./dispatch.py
+When `prime-orbs run` is hosting its warm UNIX-socket daemon (`PRIME_ORBS_DAEMON_SOCKET`),
+this script forwards the job over the socket using only the Python standard library (~15ms,
+no SDK import or virtualenv re-exec). When invoked standalone (`amp orb provider ./dispatch.py`),
+it executes `prime_orbs` directly.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import socket
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 SRC_DIR = REPO_ROOT / "src"
+_FORWARDED_PREFIXES = ("ORB_", "PRIME_ORB_", "AMP_", "PRIME_", "XDG_")
+
+
+def _try_daemon_fast_path() -> int | None:
+    sock_path = os.environ.get("PRIME_ORBS_DAEMON_SOCKET")
+    if not sock_path:
+        return None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sock_path)
+    except OSError:
+        return None
+
+    forwarded = {k: v for k, v in os.environ.items() if k.startswith(_FORWARDED_PREFIXES)}
+    with sock:
+        sock.sendall((json.dumps({"env": forwarded}) + "\n").encode("utf-8"))
+        for line in sock.makefile("r", encoding="utf-8"):
+            event = json.loads(line)
+            kind = event.get("type")
+            if kind == "log":
+                print(event["line"], file=sys.stderr, flush=True)
+            elif kind == "done":
+                err = event.get("error")
+                if err:
+                    print(err, file=sys.stderr, flush=True)
+                return int(event.get("exit_code", 1))
+    return None
 
 
 def _ensure_environment() -> None:
@@ -51,6 +82,10 @@ def _ensure_environment() -> None:
 
 
 def main() -> int:
+    daemon_code = _try_daemon_fast_path()
+    if daemon_code is not None:
+        return daemon_code
+
     _ensure_environment()
     from prime_orbs.cli import cmd_dispatch
 

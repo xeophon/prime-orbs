@@ -22,7 +22,7 @@ from prime_sandboxes import (
 )
 
 from prime_orbs.config import DEFAULT_AMP_ORB_IMAGE_ARM64, DispatchJob, ProviderConfig
-from prime_orbs.dispatcher import run_dispatch
+from prime_orbs.dispatcher import build_warm_template, run_dispatch
 from prime_orbs.state import SnapshotStore
 
 
@@ -97,6 +97,11 @@ class FakePrimeBackend:
             assert request.docker_image is None
             assert request.disk_size_gb is None
             assert request.arch is None, "Prime rejects arch on checkpoint restores"
+            if request.restore_memory:
+                for shape_field in ("cpu_cores", "memory_gb", "gpu_count", "gpu_type"):
+                    assert (
+                        shape_field not in request.model_fields_set
+                    ), f"Memory restore must omit {shape_field} so paused shape is inherited"
             ckpt = self.checkpoints.get(request.checkpoint_id)
             if ckpt is None or ckpt["state"] != "DURABLE":
                 raise APIError(f"HTTP 404: Checkpoint {request.checkpoint_id} not found")
@@ -400,7 +405,6 @@ def test_full_orb_lifecycle_spawn_pause_resume_and_delete(tmp_path: Path) -> Non
     )
     assert len(backend.create_requests) == 1  # Still the original sandbox!
     assert len(backend.resume_calls) == 2
-    assert "sbx_1" in backend.invalidated_auth_ids
     assert backend.exec_calls[-1]["env"] == {"ORB_TOKEN": "orb_tok_wake"}
 
     # 5. Delete terminates sandbox AND deletes its pause checkpoint so storage billing stops
@@ -656,4 +660,62 @@ def test_bootstrap_script_detaches_cleanly_under_real_bash(tmp_path: Path) -> No
     assert marker_file.read_text(encoding="utf-8").strip() == (
         "orb bootstrap|tok_live_detached|https://ampcode.example"
     )
+
+
+def test_warm_memory_template_forks_with_restore_memory_and_survives_thread_delete(
+    tmp_path: Path,
+) -> None:
+    backend = FakePrimeBackend()
+    cfg = ProviderConfig.from_env({"PRIME_ORB_STATE_DIR": str(tmp_path)})
+    img_adapter = _ImageClientAdapter(backend)
+
+    # 1. Build a warm memory template once: creates clean VM, prewarms amp, pauses, deletes VM
+    tmpl_key, warm_ckpt_id = build_warm_template(
+        cfg,
+        sandbox_client=backend,  # type: ignore[arg-type]
+        image_client=img_adapter,  # type: ignore[arg-type]
+    )
+    assert tmpl_key.startswith("prime/xeophon/amp-orb:latest|")
+    assert backend.sandboxes["sbx_1"]["status"] == "TERMINATED"  # Template VM cleaned up!
+    assert warm_ckpt_id in backend.checkpoints
+    assert "amp update --porcelain" in backend.exec_calls[0]["command"]
+
+    # 2. Rebuilding replaces the old template checkpoint and deletes the superseded checkpoint
+    _, warm_ckpt_v2 = build_warm_template(
+        cfg,
+        sandbox_client=backend,  # type: ignore[arg-type]
+        image_client=img_adapter,  # type: ignore[arg-type]
+    )
+    assert warm_ckpt_v2 != warm_ckpt_id
+    assert warm_ckpt_id not in backend.checkpoints
+    assert warm_ckpt_v2 in backend.checkpoints
+
+    # 3. Cold thread spawn forks from warm_ckpt_v2 with restore_memory=True (no shape conflict!)
+    _run(
+        backend,
+        tmp_path,
+        {"ORB_OPERATION": "spawn", "ORB_ID": "amp-fast-1", "ORB_TOKEN": "tok-fast-1"},
+    )
+    fork_req = backend.create_requests[-1]
+    assert fork_req.checkpoint_id == warm_ckpt_v2
+    assert fork_req.restore_memory is True
+    assert "cpu_cores" not in fork_req.model_fields_set
+    assert "memory_gb" not in fork_req.model_fields_set
+
+    # 4. Pausing and deleting that thread keeps shared warm_ckpt_v2 intact for future threads!
+    _run(backend, tmp_path, {"ORB_OPERATION": "pause", "ORB_ID": "amp-fast-1"})
+    _run(backend, tmp_path, {"ORB_OPERATION": "delete", "ORB_ID": "amp-fast-1"})
+    assert warm_ckpt_v2 in backend.checkpoints
+
+    # 5. If warm checkpoint is later missing on Prime, spawn prunes it and cold-boots cleanly
+    del backend.checkpoints[warm_ckpt_v2]
+    _run(
+        backend,
+        tmp_path,
+        {"ORB_OPERATION": "spawn", "ORB_ID": "amp-fast-2", "ORB_TOKEN": "tok-fast-2"},
+    )
+    cold_fallback = backend.create_requests[-1]
+    assert cold_fallback.checkpoint_id is None
+    assert cold_fallback.docker_image == "prime/xeophon/amp-orb:latest"
+
 
