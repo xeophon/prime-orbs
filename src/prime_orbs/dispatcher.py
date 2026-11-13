@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -72,7 +73,10 @@ sync
 """
 
 LogFn = Callable[[str], None]
-StandbyClaimFn = Callable[[str, OrbSpec, float, LogFn], Sandbox | None]
+# Returns `(sandbox_id, optimistic_running)` or None
+StandbyClaimFn = Callable[[str, OrbSpec, float, LogFn], tuple[str, bool] | None]
+ProjectStandbyClaimFn = Callable[[str, OrbSpec, float, LogFn], tuple[str, bool] | None]
+ProjectStandbyTouchFn = Callable[[str, OrbSpec], None]
 SnapshotSavedFn = Callable[[str, str, OrbSpec], None]
 
 
@@ -97,6 +101,10 @@ def warm_template_key(resolved_image: str, spec: OrbSpec) -> str:
         f"{resolved_image}|cpu={spec.cpu_cores:g}|mem={spec.memory_gb:g}"
         f"|disk={spec.disk_size_gb:g}|arch={arch}"
     )
+
+
+def project_standby_key(orb_snapshot_id: str, spec: OrbSpec) -> str:
+    return f"snap:{orb_snapshot_id}|cpu={spec.cpu_cores:g}|mem={spec.memory_gb:g}"
 
 
 def snapshot_memory_mode(spec: OrbSpec) -> str:
@@ -136,6 +144,22 @@ def _invalidate_gateway_auth(client: SandboxClient, sandbox_id: str) -> None:
             invalidate(sandbox_id)
 
 
+def _prefetch_gateway_auth_async(client: SandboxClient, sandbox_id: str) -> None:
+    """Refresh an expired gateway auth token concurrently while a paused VM resumes."""
+    auth_cache = getattr(client, "_auth_cache", None)
+    get_or_refresh = getattr(auth_cache, "get_or_refresh", None)
+    if not callable(get_or_refresh):
+        return
+
+    def _worker() -> None:
+        with contextlib.suppress(Exception):
+            get_or_refresh(sandbox_id)
+
+    threading.Thread(
+        target=_worker, name=f"prime-auth-prefetch-{sandbox_id[:12]}", daemon=True
+    ).start()
+
+
 def _is_waiting_for_image_build(sandbox: Sandbox) -> bool:
     return sandbox.status == "PENDING" and bool(getattr(sandbox, "pending_image_build_id", None))
 
@@ -162,15 +186,15 @@ def sync_known_orbs(
 ) -> dict[str, str]:
     """Reconcile `store.orb_sandboxes` once on daemon startup for O(0)-GET new-thread checks."""
     reconciled: dict[str, str] = {}
+    states: dict[str, str] = {}
 
-    # 1. Preserve any persisted orb_id -> sandbox_id mappings (including claimed standby VMs).
     for orb_id, sbx_id in store.all_orb_sandboxes().items():
         with contextlib.suppress(APIError):
             sbx = client.get(sbx_id)
             if sbx.status not in TERMINAL_STATUSES:
                 reconciled[orb_id] = sbx.id
+                states[orb_id] = sbx.status
 
-    # 2. Discover any labeled `amp-orb` sandboxes created outside local state.
     by_orb: dict[str, list[Sandbox]] = {}
     cursor: str | None = None
     seen_cursors: set[str] = set()
@@ -190,11 +214,12 @@ def sync_known_orbs(
     for orb_id, items in by_orb.items():
         items.sort(key=lambda s: _aware_utc(s.created_at), reverse=True)
         reconciled[orb_id] = items[0].id
+        states[orb_id] = items[0].status
         for extra in items[1:]:
             log_fn(f"Deleting duplicate active sandbox {extra.id} for {orb_id}")
             _safe_delete_sandbox(client, extra.id)
 
-    store.replace_orb_sandboxes(reconciled)
+    store.replace_orb_sandboxes(reconciled, states)
     return reconciled
 
 
@@ -233,12 +258,12 @@ def _resolve_existing_orb_sandbox(
     *,
     authoritative_index: bool = False,
 ) -> tuple[Sandbox | None, list[Sandbox]]:
-    """Fast-path lookup via cached `orb_id -> sandbox_id` (0 GETs when brand-new in daemon)."""
     cached_id = store.get_orb_sandbox(orb_id)
     if cached_id:
         try:
             sbx = client.get(cached_id)
             if sbx.status not in TERMINAL_STATUSES:
+                store.set_orb_state(orb_id, sbx.status)
                 return sbx, []
             store.remove_orb_sandbox(orb_id)
             return None, [sbx]
@@ -259,7 +284,7 @@ def _resolve_existing_orb_sandbox(
 
     if active:
         chosen = active[0]
-        store.set_orb_sandbox(orb_id, chosen.id)
+        store.set_orb_sandbox(orb_id, chosen.id, status=chosen.status)
         return chosen, terminated
     return None, terminated
 
@@ -273,6 +298,8 @@ def run_dispatch(
     log_fn: LogFn = default_log,
     authoritative_index: bool = False,
     standby_claim_fn: StandbyClaimFn | None = None,
+    project_standby_claim_fn: ProjectStandbyClaimFn | None = None,
+    project_standby_touch_fn: ProjectStandbyTouchFn | None = None,
     on_snapshot_saved: SnapshotSavedFn | None = None,
 ) -> None:
     """Execute one `spawn`, `pause`, or `delete` job against Prime Sandboxes."""
@@ -302,6 +329,8 @@ def run_dispatch(
                 log_fn,
                 authoritative_index=authoritative_index,
                 standby_claim_fn=standby_claim_fn,
+                project_standby_claim_fn=project_standby_claim_fn,
+                project_standby_touch_fn=project_standby_touch_fn,
             )
         elif job.operation == "pause":
             _handle_pause(
@@ -331,21 +360,50 @@ def _handle_spawn(
     *,
     authoritative_index: bool = False,
     standby_claim_fn: StandbyClaimFn | None = None,
+    project_standby_claim_fn: ProjectStandbyClaimFn | None = None,
+    project_standby_touch_fn: ProjectStandbyTouchFn | None = None,
 ) -> None:
     spec = config.resolve_spec(job)
-    candidate, terminated = _resolve_existing_orb_sandbox(
-        client, store, job.orb_id, log, authoritative_index=authoritative_index
-    )
+    running_sandbox_id: str | None = None
+    terminated: list[Sandbox] = []
 
-    running_sandbox: Sandbox | None = None
-    if candidate is not None:
-        running_sandbox = _ensure_existing_running(client, candidate, job.orb_id, deadline, log)
-        if running_sandbox is None:
+    # Fast speculative wake path: when local state knows this orb is PAUSED, fire POST /resume
+    # immediately on ms 0 (skipping a preceding GET /sandbox/{id}) while prefetching gateway auth!
+    cached_id, cached_state = store.get_orb_sandbox_with_state(job.orb_id)
+    if cached_id and cached_state == "PAUSED":
+        log(f"Speculatively resuming paused sandbox {cached_id} for {job.orb_id}")
+        _prefetch_gateway_auth_async(client, cached_id)
+        resumed = _speculative_resume_until_running(client, cached_id, deadline, log)
+        if resumed is not None:
+            running_sandbox_id = resumed.id
+            store.set_orb_sandbox(job.orb_id, resumed.id, status="RUNNING")
+        else:
             store.remove_orb_sandbox(job.orb_id)
-            terminated.insert(0, candidate)
+            with contextlib.suppress(APIError):
+                dead = client.get(cached_id)
+                if dead.status in TERMINAL_STATUSES:
+                    terminated.append(dead)
+    else:
+        candidate, found_terminated = _resolve_existing_orb_sandbox(
+            client, store, job.orb_id, log, authoritative_index=authoritative_index
+        )
+        terminated.extend(found_terminated)
+        if candidate is not None:
+            ensured = _ensure_existing_running(client, candidate, job.orb_id, deadline, log)
+            if ensured is not None:
+                running_sandbox_id = ensured.id
+                store.set_orb_sandbox(job.orb_id, ensured.id, status="RUNNING")
+            else:
+                store.remove_orb_sandbox(job.orb_id)
+                terminated.insert(0, candidate)
 
-    if running_sandbox is None:
-        running_sandbox = _create_orb_sandbox(
+    if running_sandbox_id is not None:
+        _launch_bootstrap_when_ready(client, running_sandbox_id, job, config, deadline, log)
+        return
+
+    # New orb creation / standby claim loop (retries if an optimistic hot standby died while idle).
+    while True:
+        sandbox_id, optimistic_running = _acquire_new_orb_sandbox(
             job=job,
             spec=spec,
             config=config,
@@ -356,10 +414,70 @@ def _handle_spawn(
             deadline=deadline,
             log=log,
             standby_claim_fn=standby_claim_fn,
+            project_standby_claim_fn=project_standby_claim_fn,
+            project_standby_touch_fn=project_standby_touch_fn,
         )
-        store.set_orb_sandbox(job.orb_id, running_sandbox.id)
+        try:
+            _launch_bootstrap_when_ready(
+                client,
+                sandbox_id,
+                job,
+                config,
+                deadline,
+                log,
+                fast_fail_if_dead=optimistic_running,
+            )
+            store.set_orb_sandbox(job.orb_id, sandbox_id, status="RUNNING")
+            return
+        except SandboxNotRunningError as exc:
+            if not optimistic_running:
+                raise
+            log(
+                f"Optimistic standby sandbox {sandbox_id} was no longer running ({exc}); "
+                "falling back"
+            )
+            _safe_delete_sandbox(client, sandbox_id)
 
-    _launch_bootstrap_when_ready(client, running_sandbox.id, job, config, deadline, log)
+
+def _speculative_resume_until_running(
+    client: SandboxClient,
+    sandbox_id: str,
+    deadline: float,
+    log: LogFn,
+) -> Sandbox | None:
+    """Send `POST /sandbox/{id}/resume` without a prior `GET`, handling already-RUNNING or dead."""
+    try:
+        accepted = client.resume(sandbox_id)
+    except APIError as exc:
+        msg = str(exc)
+        if "HTTP 404" in msg or "not found" in msg.lower():
+            return None
+        try:
+            current = client.get(sandbox_id)
+        except APIError:
+            return None
+        if current.status == "RUNNING":
+            return current
+        if current.status in TERMINAL_STATUSES:
+            return None
+        if current.status in ("PENDING", "PROVISIONING"):
+            return _poll_until_running(client, current, deadline)
+        # Transient 409/5xx while prior pause was still settling -> standard retry loop.
+        try:
+            return _resume_until_running(client, current, deadline, log)
+        except SandboxNotRunningError:
+            return None
+
+    if accepted.status == "RUNNING":
+        return accepted
+    try:
+        return _await_resumed_sandbox(client, sandbox_id, accepted.error_message, deadline, log)
+    except SandboxNotRunningError as exc:
+        log(
+            f"Paused sandbox {sandbox_id} could not resume ({exc}); "
+            "falling back to checkpoint/image recovery"
+        )
+        return None
 
 
 def _ensure_existing_running(
@@ -372,6 +490,7 @@ def _ensure_existing_running(
     """Resume or wait on an existing sandbox; return None only if its node died irrecoverably."""
     if sandbox.status == "PAUSED":
         log(f"Resuming paused sandbox {sandbox.id} for {orb_id}")
+        _prefetch_gateway_auth_async(client, sandbox.id)
         try:
             return _resume_until_running(client, sandbox, deadline, log)
         except SandboxNotRunningError as exc:
@@ -426,18 +545,26 @@ def _resume_until_running(
     accepted = _request_resume_with_retry(client, sandbox.id, deadline)
     if accepted.status == "RUNNING":
         return accepted
-    baseline_error = accepted.error_message
+    return _await_resumed_sandbox(client, sandbox.id, accepted.error_message, deadline, log)
 
+
+def _await_resumed_sandbox(
+    client: SandboxClient,
+    sandbox_id: str,
+    baseline_error: str | None,
+    deadline: float,
+    log: LogFn,
+) -> Sandbox:
     retried_after_node_error = False
     started = time.monotonic()
     while True:
         remaining = _remaining(deadline)
-        current = client.get(sandbox.id)
+        current = client.get(sandbox_id)
         if current.status == "RUNNING":
             return current
         if current.status in TERMINAL_STATUSES:
             raise SandboxNotRunningError(
-                sandbox.id,
+                sandbox_id,
                 message=(
                     f"Sandbox entered {current.status} during resume: "
                     f"{current.error_message or current.termination_reason or 'no details'}"
@@ -451,13 +578,13 @@ def _resume_until_running(
             if not retried_after_node_error:
                 retried_after_node_error = True
                 log(f"Resume reported error ({current.error_message}); retrying once")
-                accepted_retry = _request_resume_with_retry(client, sandbox.id, deadline)
+                accepted_retry = _request_resume_with_retry(client, sandbox_id, deadline)
                 if accepted_retry.status == "RUNNING":
                     return accepted_retry
                 baseline_error = accepted_retry.error_message
             else:
                 raise RuntimeError(
-                    f"Failed to resume paused sandbox {sandbox.id}: {current.error_message}"
+                    f"Failed to resume paused sandbox {sandbox_id}: {current.error_message}"
                 )
         time.sleep(min(_fast_poll_delay(time.monotonic() - started), remaining))
 
@@ -540,8 +667,6 @@ def _build_create_request(
         idempotency_key=_deterministic_idempotency_key(orb_id, generation, source_tag),
     )
     if checkpoint_id is not None and restore_memory:
-        # Memory restores inherit cpu_cores, memory_gb, gpu_count, gpu_type, disk, and arch
-        # directly from the paused template VM; leave those fields unset on the model.
         return CreateSandboxRequest(
             checkpoint_id=checkpoint_id,
             restore_memory=True,
@@ -568,7 +693,7 @@ def _build_create_request(
     )
 
 
-def _create_orb_sandbox(
+def _acquire_new_orb_sandbox(
     *,
     job: DispatchJob,
     spec: OrbSpec,
@@ -580,7 +705,10 @@ def _create_orb_sandbox(
     deadline: float,
     log: LogFn,
     standby_claim_fn: StandbyClaimFn | None = None,
-) -> Sandbox:
+    project_standby_claim_fn: ProjectStandbyClaimFn | None = None,
+    project_standby_touch_fn: ProjectStandbyTouchFn | None = None,
+) -> tuple[str, bool]:
+    """Return `(sandbox_id, optimistic_running)` for a newly acquired orb VM."""
     generation = len(terminated)
 
     # 1. Recover this orb's disk if a previous sandbox was checkpointed (GPU pause or lost node).
@@ -597,7 +725,7 @@ def _create_orb_sandbox(
                     checkpoint_id=recovery_ckpt,
                 )
             )
-            return _poll_until_running(client, created, deadline)
+            return _poll_until_running(client, created, deadline).id, False
         except APIError as exc:
             log(f"Orb checkpoint {recovery_ckpt} restore failed ({exc}); falling back")
             store.remove_orb_checkpoint(job.orb_id)
@@ -605,6 +733,35 @@ def _create_orb_sandbox(
     # 2. Boot from shared Amp project snapshot (ORB_SNAPSHOT_ID) when available.
     if config.snapshots_enabled and job.orb_snapshot_id:
         mapped_ckpt, snap_mode = store.get_project_snapshot_entry(job.orb_snapshot_id)
+        if mapped_ckpt:
+            if project_standby_touch_fn is not None and spec.gpu_count == 0:
+                project_standby_touch_fn(job.orb_snapshot_id, spec)
+
+            # 2a. Claim a pre-placed standby VM already booted from this exact project snapshot!
+            if project_standby_claim_fn is not None and spec.gpu_count == 0:
+                claimed_proj = project_standby_claim_fn(
+                    job.orb_snapshot_id, spec, deadline, log
+                )
+                if claimed_proj is not None:
+                    return claimed_proj
+
+            # 2b. If pause returned asynchronously before checkpoint upload finished, wait now.
+            if snap_mode == "uploading":
+                try:
+                    durable = client.wait_for_checkpoint(
+                        mapped_ckpt, timeout_seconds=_remaining(deadline, floor=5.0)
+                    )
+                    mapped_ckpt = durable.id
+                    snap_mode = "disk"
+                    store.set_project_snapshot(job.orb_snapshot_id, mapped_ckpt, mode="disk")
+                except (APIError, RuntimeError, TimeoutError) as exc:
+                    log(
+                        f"Project snapshot {job.orb_snapshot_id} upload did not complete ({exc}); "
+                        "falling back to base image"
+                    )
+                    store.remove_project_snapshot(job.orb_snapshot_id)
+                    mapped_ckpt = None
+
         if mapped_ckpt:
             use_memory = snap_mode == snapshot_memory_mode(spec) and spec.gpu_count == 0
             kind_desc = "memory-promoted" if use_memory else "disk"
@@ -623,7 +780,7 @@ def _create_orb_sandbox(
                         restore_memory=use_memory,
                     )
                 )
-                return _poll_until_running(client, created, deadline)
+                return _poll_until_running(client, created, deadline).id, False
             except APIError as exc:
                 log(
                     f"Project snapshot {job.orb_snapshot_id} restore failed ({exc}); "
@@ -633,7 +790,7 @@ def _create_orb_sandbox(
 
     resolved_image = resolve_prime_image(spec.image, image_client, deadline=deadline)
 
-    # 3. Claim a pre-placed RUNNING/PAUSED VM from the daemon's adaptive standby pool.
+    # 3. Claim a pre-placed RUNNING/PAUSED VM from the daemon's base standby pool.
     if standby_claim_fn is not None and spec.gpu_count == 0:
         claimed = standby_claim_fn(resolved_image, spec, deadline, log)
         if claimed is not None:
@@ -656,7 +813,7 @@ def _create_orb_sandbox(
                         restore_memory=True,
                     )
                 )
-                return _poll_until_running(client, created, deadline)
+                return _poll_until_running(client, created, deadline).id, False
             except APIError as exc:
                 log(
                     f"Warm memory checkpoint {warm_ckpt} fork failed ({exc}); "
@@ -678,7 +835,7 @@ def _create_orb_sandbox(
             docker_image=resolved_image,
         )
     )
-    return _poll_until_running(client, created, deadline)
+    return _poll_until_running(client, created, deadline).id, False
 
 
 def _execute_when_gateway_ready(
@@ -690,6 +847,7 @@ def _execute_when_gateway_ready(
     user: str | None,
     deadline: float,
     action_label: str,
+    fast_fail_if_dead: bool = False,
 ) -> None:
     """Run `script` as soon as the guest gateway registers, without a throwaway echo RPC."""
     started = time.monotonic()
@@ -722,11 +880,22 @@ def _execute_when_gateway_ready(
             attempt += 1
             if (deadline - time.monotonic()) <= 0.25:
                 break
-            if attempt >= 2:
+            check_threshold = 1 if fast_fail_if_dead else 2
+            if attempt >= check_threshold:
                 _invalidate_gateway_auth(client, sandbox_id)
-                with contextlib.suppress(APIError):
+                try:
                     sbx = client.get(sandbox_id)
-                    if sbx.status in TERMINAL_STATUSES:
+                except APIError as get_exc:
+                    if fast_fail_if_dead and (
+                        "HTTP 404" in str(get_exc) or "not found" in str(get_exc).lower()
+                    ):
+                        raise SandboxNotRunningError(
+                            sandbox_id, message="Standby sandbox no longer exists"
+                        ) from exc
+                else:
+                    if sbx.status in TERMINAL_STATUSES or (
+                        fast_fail_if_dead and sbx.status != "RUNNING"
+                    ):
                         raise SandboxNotRunningError(
                             sandbox_id,
                             message=(
@@ -748,6 +917,8 @@ def _launch_bootstrap_when_ready(
     config: ProviderConfig,
     deadline: float,
     log: LogFn,
+    *,
+    fast_fail_if_dead: bool = False,
 ) -> None:
     assert job.orb_token is not None
     envs: dict[str, str] = {"ORB_TOKEN": job.orb_token}
@@ -762,6 +933,7 @@ def _launch_bootstrap_when_ready(
         user=config.orb_user,
         deadline=deadline,
         action_label="`amp orb bootstrap`",
+        fast_fail_if_dead=fast_fail_if_dead,
     )
     log(f"Started `amp orb bootstrap` in sandbox {sandbox_id}")
 
@@ -776,11 +948,7 @@ def build_warm_template(
     timeout_seconds: float = 600.0,
     log_fn: LogFn = default_log,
 ) -> tuple[str, str]:
-    """Boot a clean orb VM, prewarm `amp` in guest RAM, pause it, and store its memory checkpoint.
-
-    Returns `(template_key, durable_checkpoint_id)`. The temporary VM is deleted once its
-    pause checkpoint is DURABLE, leaving zero running compute.
-    """
+    """Boot a clean orb VM, prewarm `amp` in guest RAM, and store its pause checkpoint."""
     deadline = time.monotonic() + timeout_seconds
     synthetic_job = DispatchJob(
         operation="spawn",
@@ -888,19 +1056,38 @@ def _record_project_snapshot_from_checkpoint(
     log: LogFn,
     on_snapshot_saved: SnapshotSavedFn | None,
 ) -> None:
+    snap_spec = replace(
+        config.default_spec,
+        cpu_cores=sandbox.cpu_cores,
+        memory_gb=sandbox.memory_gb,
+        disk_size_gb=sandbox.disk_size_gb,
+        gpu_count=sandbox.gpu_count,
+        gpu_type=sandbox.gpu_type,
+        region=sandbox.region,
+    )
     existing_ckpt, existing_mode = store.get_project_snapshot_entry(orb_snapshot_id)
-    if existing_ckpt and _get_durable_checkpoint_id(client, existing_ckpt):
-        if existing_mode == "disk" and on_snapshot_saved is not None:
-            snap_spec = replace(
-                config.default_spec,
-                cpu_cores=sandbox.cpu_cores,
-                memory_gb=sandbox.memory_gb,
-                disk_size_gb=sandbox.disk_size_gb,
-                gpu_count=sandbox.gpu_count,
-                gpu_type=sandbox.gpu_type,
-                region=sandbox.region,
-            )
+    if existing_ckpt and existing_mode != "uploading" and _get_durable_checkpoint_id(
+        client, existing_ckpt
+    ):
+        if existing_mode == "disk" and on_snapshot_saved is not None and sandbox.gpu_count == 0:
             on_snapshot_saved(orb_snapshot_id, existing_ckpt, snap_spec)
+        return
+
+    # Under DispatchDaemon (`on_snapshot_saved` provided), return from `pause` immediately
+    # so Amp's mid-setup `pause -> spawn` cycle never stalls on object-storage upload!
+    if on_snapshot_saved is not None and sandbox.gpu_count == 0:
+        previous = store.set_project_snapshot(orb_snapshot_id, checkpoint_id, mode="uploading")
+        if (
+            previous
+            and previous != checkpoint_id
+            and previous not in store.referenced_checkpoint_ids()
+        ):
+            _safe_delete_checkpoint(client, previous, deadline)
+        log(
+            f"Queued async finalize & memory promotion for project snapshot "
+            f"{orb_snapshot_id} (checkpoint {checkpoint_id})"
+        )
+        on_snapshot_saved(orb_snapshot_id, checkpoint_id, snap_spec)
         return
 
     durable = client.wait_for_checkpoint(
@@ -909,19 +1096,7 @@ def _record_project_snapshot_from_checkpoint(
     previous = store.set_project_snapshot(orb_snapshot_id, durable.id, mode="disk")
     if previous and previous != durable.id and previous not in store.referenced_checkpoint_ids():
         _safe_delete_checkpoint(client, previous, deadline)
-
     log(f"Saved project snapshot {orb_snapshot_id} -> checkpoint {durable.id}")
-    if on_snapshot_saved is not None and sandbox.gpu_count == 0:
-        snap_spec = replace(
-            config.default_spec,
-            cpu_cores=sandbox.cpu_cores,
-            memory_gb=sandbox.memory_gb,
-            disk_size_gb=sandbox.disk_size_gb,
-            gpu_count=sandbox.gpu_count,
-            gpu_type=sandbox.gpu_type,
-            region=sandbox.region,
-        )
-        on_snapshot_saved(orb_snapshot_id, durable.id, snap_spec)
 
 
 def _handle_pause(
@@ -947,8 +1122,8 @@ def _handle_pause(
 
     want_snapshot = bool(config.snapshots_enabled and job.orb_snapshot_id)
 
-    # Already PAUSED: reuse its existing pause checkpoint if a project snapshot was requested.
     if sandbox.status == "PAUSED":
+        store.set_orb_sandbox(job.orb_id, sandbox.id, status="PAUSED")
         if want_snapshot and job.orb_snapshot_id:
             ckpt_id = store.get_orb_checkpoint(job.orb_id)
             if not ckpt_id:
@@ -969,9 +1144,9 @@ def _handle_pause(
         return
 
     if sandbox.status in TERMINAL_STATUSES:
+        store.remove_orb_sandbox(job.orb_id)
         return
 
-    # Prime GPU sandboxes cannot pause in memory; checkpoint rootfs once and delete compute.
     if sandbox.gpu_count > 0:
         _checkpoint_and_delete_for_pause(
             client=client,
@@ -984,7 +1159,6 @@ def _handle_pause(
         )
         return
 
-    # Standard CPU VM: a single `pause()` freezes both memory and a cold-bootable disk checkpoint!
     try:
         paused = client.pause(sandbox.id)
     except APIError as exc:
@@ -1010,6 +1184,7 @@ def _handle_pause(
         store.set_orb_checkpoint(job.orb_id, pause_ckpt_id)
 
     _poll_until_paused(client, sandbox.id, paused.error_message, deadline)
+    store.set_orb_sandbox(job.orb_id, sandbox.id, status="PAUSED")
     log(f"Paused sandbox {sandbox.id} for {job.orb_id}")
 
     if want_snapshot and job.orb_snapshot_id:
@@ -1074,8 +1249,11 @@ def expire_stale_project_snapshots(
     now = datetime.now(UTC)
     expired = 0
     deadline = time.monotonic() + 60.0
+    modes = store.all_project_snapshot_modes()
 
     for snap_id, ckpt_id in list(store.all_project_snapshots().items()):
+        if modes.get(snap_id) == "uploading":
+            continue
         try:
             ckpt = client.get_checkpoint(ckpt_id)
         except APIError:

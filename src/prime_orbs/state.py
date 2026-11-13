@@ -21,6 +21,7 @@ _STORE_SECTIONS = (
     "project_snapshot_modes",
     "orb_checkpoints",
     "orb_sandboxes",
+    "orb_states",
     "warm_templates",
     "standby_sandboxes",
 )
@@ -130,24 +131,53 @@ class SnapshotStore:
         with self._mutate() as data:
             data["orb_checkpoints"].pop(orb_id, None)
 
-    # --- Active sandbox ID cache (ORB_ID -> sandbox_id) ---
+    # --- Active sandbox ID & state cache (ORB_ID -> sandbox_id, status) ---
     def get_orb_sandbox(self, orb_id: str) -> str | None:
         return self._read()["orb_sandboxes"].get(orb_id)
+
+    def get_orb_sandbox_with_state(self, orb_id: str) -> tuple[str | None, str | None]:
+        data = self._read()
+        sbx_id = data["orb_sandboxes"].get(orb_id)
+        if sbx_id is None:
+            return None, None
+        return sbx_id, data["orb_states"].get(orb_id)
 
     def all_orb_sandboxes(self) -> dict[str, str]:
         return dict(self._read()["orb_sandboxes"])
 
-    def set_orb_sandbox(self, orb_id: str, sandbox_id: str) -> None:
+    def set_orb_sandbox(
+        self, orb_id: str, sandbox_id: str, *, status: str | None = None
+    ) -> None:
         with self._mutate() as data:
             data["orb_sandboxes"][orb_id] = sandbox_id
+            if status is not None:
+                data["orb_states"][orb_id] = status
 
-    def replace_orb_sandboxes(self, mapping: dict[str, str]) -> None:
+    def set_orb_state(self, orb_id: str, status: str) -> None:
+        with self._mutate() as data:
+            if orb_id in data["orb_sandboxes"]:
+                data["orb_states"][orb_id] = status
+
+    def replace_orb_sandboxes(
+        self, mapping: dict[str, str], states: dict[str, str] | None = None
+    ) -> None:
         with self._mutate() as data:
             data["orb_sandboxes"] = dict(mapping)
+            if states is not None:
+                data["orb_states"] = {
+                    orb_id: st for orb_id, st in states.items() if orb_id in mapping
+                }
+            else:
+                data["orb_states"] = {
+                    orb_id: st
+                    for orb_id, st in data["orb_states"].items()
+                    if orb_id in mapping
+                }
 
     def remove_orb_sandbox(self, orb_id: str) -> None:
         with self._mutate() as data:
             data["orb_sandboxes"].pop(orb_id, None)
+            data["orb_states"].pop(orb_id, None)
 
     # --- Warm memory-fork templates (template_key -> pause checkpoint_id) ---
     def get_warm_template(self, key: str) -> str | None:

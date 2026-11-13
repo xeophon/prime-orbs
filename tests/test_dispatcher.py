@@ -211,8 +211,12 @@ class FakePrimeBackend:
     def resume(self, sandbox_id: str) -> Sandbox:
         if self.resume_api_errors:
             raise self.resume_api_errors.pop(0)
-        self.resume_calls.append(sandbox_id)
         row = self.sandboxes[sandbox_id]
+        if row["status"] != "PAUSED":
+            raise APIError(
+                f"HTTP 409: Sandbox {sandbox_id} is {row['status']}; only PAUSED can resume"
+            )
+        self.resume_calls.append(sandbox_id)
         row["errorMessage"] = None
         self._active_poll_queue[sandbox_id] = list(
             self.next_resume_statuses.pop(

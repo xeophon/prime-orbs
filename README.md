@@ -89,7 +89,8 @@ Configure defaults in the `amp orb provider` environment:
 | `PRIME_ORB_USER` | `user` | Guest user running `amp orb bootstrap` (`""` for sandbox default) |
 | `PRIME_ORB_WARM_TEMPLATE` | `true` | Fork new CPU orbs from a cached `warm-template` memory checkpoint (`restore_memory=True`) when available |
 | `PRIME_ORB_AUTO_WARM_TEMPLATE` | `false` | Build a warm memory template automatically during `prime-orbs run` if none exists |
-| `PRIME_ORB_STANDBY_COUNT` | `1` | Pre-placed standby VMs maintained by `prime-orbs run` (`0` disables the standby pool) |
+| `PRIME_ORB_STANDBY_COUNT` | `1` | Pre-placed base standby VMs maintained by `prime-orbs run` (`0` disables all standby VMs) |
+| `PRIME_ORB_MAX_PROJECT_STANDBYS` | `2` | Maximum recently used `ORB_SNAPSHOT_ID` project snapshots with pre-placed standby VMs |
 | `PRIME_ORB_STANDBY_HOT_SECONDS` | `900` (15m) | How long standby VMs stay `RUNNING` after activity before auto-pausing (`0` pauses immediately) |
 | `PRIME_ORB_SNAPSHOTS` | `true` | Enable `ORB_SNAPSHOT_ID` project snapshots (reusing pause checkpoints & promoting them to memory checkpoints in the background) |
 | `PRIME_ORB_SNAPSHOT_TTL_SECONDS` | `345600` (96h) | Server-side TTL for project snapshot checkpoints (`0` disables expiry) |

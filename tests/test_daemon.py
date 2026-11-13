@@ -205,6 +205,246 @@ def test_standby_pool_hot_claim_restart_preservation_idle_cooling_and_drain(
     assert backend.sandboxes[standby_two.id]["status"] == "RUNNING"
 
 
+def test_single_rpc_hot_standby_claim_and_dead_standby_recovery(tmp_path: Path) -> None:
+    """Prove a hot standby claim makes 0 GET/LIST/CREATE calls (1 single ConnectRPC call),
+    and recovers transparently if an idle standby VM died silently on Prime."""
+    repo_root = Path(__file__).resolve().parents[1]
+    state_dir = tmp_path / "single_rpc_state"
+    sock_path = daemon_socket_path(state_dir)
+    backend = FakePrimeBackend()
+    img_adapter = _ImageClientAdapter(backend)
+
+    get_calls: list[str] = []
+    list_calls: int = 0
+    orig_get = backend.get
+    orig_list = backend.list
+    orig_exec = backend.execute_command
+
+    def tracked_get(sandbox_id: str):  # type: ignore[no-untyped-def]
+        get_calls.append(sandbox_id)
+        return orig_get(sandbox_id)
+
+    def tracked_list(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal list_calls
+        list_calls += 1
+        return orig_list(**kwargs)
+
+    def realistic_exec(sandbox_id: str, command: str, **kwargs):  # type: ignore[no-untyped-def]
+        from prime_sandboxes import APIError
+
+        if backend.sandboxes[sandbox_id]["status"] != "RUNNING":
+            raise APIError(f"Sandbox {sandbox_id} not running")
+        return orig_exec(sandbox_id, command, **kwargs)
+
+    backend.get = tracked_get  # type: ignore[method-assign]
+    backend.list = tracked_list  # type: ignore[method-assign]
+    backend.execute_command = realistic_exec  # type: ignore[method-assign]
+
+    base_env = {
+        "PRIME_ORB_STATE_DIR": str(state_dir),
+        "ORB_IMAGE": "prime/xeophon/amp-orb:latest",
+        "PRIME_ORB_STANDBY_COUNT": "1",
+    }
+    with DispatchDaemon(
+        sock_path,
+        base_env=base_env,
+        sandbox_client=backend,  # type: ignore[arg-type]
+        image_client=img_adapter,  # type: ignore[arg-type]
+        enable_standby_worker=False,
+    ) as daemon:
+        hot_sbx = daemon.standby_pool.replenish_once()
+        assert hot_sbx is not None
+
+        # Reset counters right before spawn:
+        get_calls.clear()
+        list_calls = 0
+        creates_before = len(backend.create_requests)
+        execs_before = len(backend.exec_calls)
+
+        proc = subprocess.run(
+            [sys.executable, str(repo_root / "dispatch.py")],
+            env={
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                DAEMON_SOCKET_ENV: str(sock_path),
+                "PRIME_ORB_STATE_DIR": str(state_dir),
+                "ORB_OPERATION": "spawn",
+                "ORB_ID": "amp-1rpc",
+                "ORB_TOKEN": "tok_1rpc",
+            },
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert get_calls == [], f"Expected 0 GET calls on hot claim, got {get_calls}"
+        assert list_calls == 0
+        assert len(backend.create_requests) == creates_before
+        assert len(backend.exec_calls) == execs_before + 1
+
+        # Now replenish another standby, silently kill it on the backend, and verify recovery:
+        dead_standby = daemon.standby_pool.replenish_once()
+        assert dead_standby is not None
+        backend.sandboxes[dead_standby.id]["status"] = "TERMINATED"
+
+        proc_recover = subprocess.run(
+            [sys.executable, str(repo_root / "dispatch.py")],
+            env={
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                DAEMON_SOCKET_ENV: str(sock_path),
+                "PRIME_ORB_STATE_DIR": str(state_dir),
+                "ORB_OPERATION": "spawn",
+                "ORB_ID": "amp-recover-dead-standby",
+                "ORB_TOKEN": "tok_rec",
+            },
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert proc_recover.returncode == 0, proc_recover.stderr
+        assert "Optimistic standby sandbox" in proc_recover.stderr
+
+
+def test_async_snapshot_pause_project_standby_claim_and_speculative_resume(
+    tmp_path: Path,
+) -> None:
+    """Verify #1 (project-snapshot standby + LRU eviction), #2 (0-wait pause on ORB_SNAPSHOT_ID),
+    and #3b (speculative POST /resume without prior GET)."""
+    from prime_orbs.config import DispatchJob
+    from prime_orbs.dispatcher import run_dispatch
+
+    state_dir = tmp_path / "proj_state"
+    backend = FakePrimeBackend()
+    img_adapter = _ImageClientAdapter(backend)
+    store = SnapshotStore(state_dir)
+
+    wait_ckpt_calls: list[str] = []
+    orig_wait_ckpt = backend.wait_for_checkpoint
+
+    def tracked_wait_ckpt(checkpoint_id: str, timeout_seconds: float = 300):  # type: ignore[no-untyped-def]
+        wait_ckpt_calls.append(checkpoint_id)
+        return orig_wait_ckpt(checkpoint_id, timeout_seconds=timeout_seconds)
+
+    backend.wait_for_checkpoint = tracked_wait_ckpt  # type: ignore[method-assign]
+
+    env = {
+        "PRIME_ORB_STATE_DIR": str(state_dir),
+        "ORB_IMAGE": "prime/xeophon/amp-orb:latest",
+        "PRIME_ORB_STANDBY_COUNT": "1",
+        "PRIME_ORB_MAX_PROJECT_STANDBYS": "1",
+    }
+    cfg = ProviderConfig.from_env(env)
+    pool = StandbyPool(cfg, backend, img_adapter, store)  # type: ignore[arg-type]
+    pool.start(run_background_worker=False)
+
+    promoted_queue: list[tuple[str, str]] = []
+    try:
+        # 1. Spawn Thread A and pause with ORB_SNAPSHOT_ID="snap-A" via async callback (#2):
+        run_dispatch(
+            DispatchJob.from_env(
+                {**env, "ORB_OPERATION": "spawn", "ORB_ID": "amp-A", "ORB_TOKEN": "tok-a"}
+            ),
+            cfg,
+            sandbox_client=backend,  # type: ignore[arg-type]
+            image_client=img_adapter,  # type: ignore[arg-type]
+            authoritative_index=True,
+        )
+        wait_ckpt_calls.clear()
+        run_dispatch(
+            DispatchJob.from_env(
+                {**env, "ORB_OPERATION": "pause", "ORB_ID": "amp-A", "ORB_SNAPSHOT_ID": "snap-A"}
+            ),
+            cfg,
+            sandbox_client=backend,  # type: ignore[arg-type]
+            image_client=img_adapter,  # type: ignore[arg-type]
+            authoritative_index=True,
+            on_snapshot_saved=lambda sid, cid, _sp: promoted_queue.append((sid, cid)),
+        )
+        # Pause returned immediately without blocking on wait_for_checkpoint!
+        assert wait_ckpt_calls == []
+        assert store.get_project_snapshot_entry("snap-A")[1] == "uploading"
+        assert len(promoted_queue) == 1
+
+        # 2. Speculative resume (#3b): waking Thread A calls resume() BEFORE any get()!
+        call_order: list[str] = []
+        orig_get = backend.get
+        orig_resume = backend.resume
+
+        def order_get(sbx_id: str):  # type: ignore[no-untyped-def]
+            call_order.append(f"get:{sbx_id}")
+            return orig_get(sbx_id)
+
+        def order_resume(sbx_id: str):  # type: ignore[no-untyped-def]
+            call_order.append(f"resume:{sbx_id}")
+            return orig_resume(sbx_id)
+
+        backend.get = order_get  # type: ignore[method-assign]
+        backend.resume = order_resume  # type: ignore[method-assign]
+
+        run_dispatch(
+            DispatchJob.from_env(
+                {**env, "ORB_OPERATION": "spawn", "ORB_ID": "amp-A", "ORB_TOKEN": "tok-a2"}
+            ),
+            cfg,
+            sandbox_client=backend,  # type: ignore[arg-type]
+            image_client=img_adapter,  # type: ignore[arg-type]
+            authoritative_index=True,
+        )
+        assert call_order[0] == "resume:sbx_1"
+
+        # 3. Promote snap-A and replenish standby pool -> warms base + snap-A project standby (#1)!
+        from prime_orbs.standby import SnapshotPromoter
+
+        promoter = SnapshotPromoter(
+            cfg,
+            backend,  # type: ignore[arg-type]
+            store,
+            on_promoted=pool.register_project_snapshot,
+        )
+        try:
+            promoter.promote_now("snap-A", promoted_queue[0][1], cfg.default_spec)
+        finally:
+            promoter.close()
+
+        base_sbx = pool.replenish_once()
+        proj_sbx = pool.replenish_once()
+        assert base_sbx is not None and proj_sbx is not None
+        assert pool.replenish_once() is None  # Quotas full!
+
+        # 4. New project thread with ORB_SNAPSHOT_ID="snap-A" claims proj_sbx in 0 creates & 0 GETs!
+        call_order.clear()
+        creates_before = len(backend.create_requests)
+        run_dispatch(
+            DispatchJob.from_env(
+                {
+                    **env,
+                    "ORB_OPERATION": "spawn",
+                    "ORB_ID": "amp-proj-fast",
+                    "ORB_TOKEN": "tok-pf",
+                    "ORB_SNAPSHOT_ID": "snap-A",
+                }
+            ),
+            cfg,
+            sandbox_client=backend,  # type: ignore[arg-type]
+            image_client=img_adapter,  # type: ignore[arg-type]
+            authoritative_index=True,
+            standby_claim_fn=pool.claim,
+            project_standby_claim_fn=pool.claim_project,
+            project_standby_touch_fn=pool.register_project_snapshot,
+        )
+        assert len(backend.create_requests) == creates_before
+        assert call_order == []  # 0 get() and 0 resume() calls!
+        assert store.get_orb_sandbox("amp-proj-fast") == proj_sbx.id
+
+        # 5. LRU eviction when a second project snapshot registers under MAX_PROJECT_STANDBYS=1:
+        proj_sbx_a2 = pool.replenish_once()
+        assert proj_sbx_a2 is not None
+        store.set_project_snapshot("snap-B", promoted_queue[0][1], mode="disk")
+        pool.register_project_snapshot("snap-B", cfg.default_spec)
+        assert backend.sandboxes[proj_sbx_a2.id]["status"] == "TERMINATED"
+    finally:
+        pool.close()
+
+
 def test_long_state_dir_falls_back_to_short_runtime_socket_path() -> None:
     deep_dir = Path("/tmp/" + ("very_long_segment_" * 8))
     sock = daemon_socket_path(deep_dir)

@@ -23,6 +23,7 @@ DEFAULT_SNAPSHOT_TTL_SECONDS = 96 * 3600
 DEFAULT_DISPATCH_TIMEOUT_SECONDS = 270.0
 DEFAULT_STANDBY_COUNT = 1
 DEFAULT_STANDBY_HOT_SECONDS = 900.0
+DEFAULT_MAX_PROJECT_STANDBYS = 2
 
 OrbOperation = Literal["spawn", "pause", "delete"]
 OrbArch = Literal["amd64", "arm64"]
@@ -155,6 +156,7 @@ class ProviderConfig:
     auto_warm_template: bool = False
     standby_count: int = DEFAULT_STANDBY_COUNT
     standby_hot_seconds: float = DEFAULT_STANDBY_HOT_SECONDS
+    max_project_standbys: int = DEFAULT_MAX_PROJECT_STANDBYS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ProviderConfig:
@@ -239,6 +241,12 @@ class ProviderConfig:
         if standby_hot_seconds < 0:
             raise ValueError("PRIME_ORB_STANDBY_HOT_SECONDS must be >= 0")
 
+        max_project_standbys = _parse_int(
+            env, "PRIME_ORB_MAX_PROJECT_STANDBYS", DEFAULT_MAX_PROJECT_STANDBYS
+        )
+        if max_project_standbys < 0:
+            raise ValueError("PRIME_ORB_MAX_PROJECT_STANDBYS must be >= 0")
+
         return cls(
             default_spec=default_spec,
             orb_types=orb_types,
@@ -252,6 +260,7 @@ class ProviderConfig:
             auto_warm_template=auto_warm_template,
             standby_count=standby_count,
             standby_hot_seconds=standby_hot_seconds,
+            max_project_standbys=max_project_standbys,
         )
 
     def resolve_spec(self, job: DispatchJob) -> OrbSpec:

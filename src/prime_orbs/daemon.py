@@ -76,6 +76,7 @@ class DispatchDaemon:
             self.sandbox_client,
             self._store,
             log_fn=default_log,
+            on_promoted=self.standby_pool.register_project_snapshot,
         )
         self._authoritative_index = False
         self._server: _ThreadingUnixStreamServer | None = None
@@ -139,6 +140,14 @@ class DispatchDaemon:
                         log_fn=log_fn,
                         authoritative_index=daemon._authoritative_index and same_state_dir,
                         standby_claim_fn=daemon.standby_pool.claim if same_state_dir else None,
+                        project_standby_claim_fn=(
+                            daemon.standby_pool.claim_project if same_state_dir else None
+                        ),
+                        project_standby_touch_fn=(
+                            daemon.standby_pool.register_project_snapshot
+                            if same_state_dir
+                            else None
+                        ),
                         on_snapshot_saved=(
                             daemon.snapshot_promoter.submit if same_state_dir else None
                         ),
