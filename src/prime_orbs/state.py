@@ -1,13 +1,15 @@
-"""Concurrency locks and local checkpoint/sandbox mapping state for Prime orbs."""
+"""Concurrency locks and mtime-cached atomic state store for Prime orbs."""
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import json
 import os
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,10 +18,16 @@ from typing import Any
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _STORE_SECTIONS = (
     "project_snapshots",
+    "project_snapshot_modes",
     "orb_checkpoints",
     "orb_sandboxes",
     "warm_templates",
+    "standby_sandboxes",
 )
+
+_CACHE_LOCK = threading.Lock()
+# resolved_path -> (st_mtime_ns, st_size, parsed_data)
+_MEMORY_CACHE: dict[Path, tuple[int, int, dict[str, dict[str, str]]]] = {}
 
 
 def _sanitize_key(key: str) -> str:
@@ -68,27 +76,44 @@ def orb_lock(state_dir: Path, orb_id: str, timeout_seconds: float = 270.0) -> It
 
 
 class SnapshotStore:
-    """Atomic JSON store mapping Amp orb/snapshot/template IDs to Prime IDs."""
+    """Atomic JSON store with an st_mtime_ns in-memory cache."""
 
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
         self.path = state_dir / "snapshots.json"
+        self._resolved_path = self.path.resolve()
         self._lock_path = state_dir / "snapshots.lock"
 
-    # --- Shared project snapshots (ORB_SNAPSHOT_ID -> checkpoint_id) ---
+    # --- Shared project snapshots (ORB_SNAPSHOT_ID -> checkpoint_id & mode) ---
     def get_project_snapshot(self, orb_snapshot_id: str) -> str | None:
         return self._read()["project_snapshots"].get(orb_snapshot_id)
+
+    def get_project_snapshot_entry(self, orb_snapshot_id: str) -> tuple[str | None, str]:
+        """Return `(checkpoint_id, mode)` where mode is `'disk'` or `'memory:<cpu>:<mem>'`."""
+        data = self._read()
+        ckpt = data["project_snapshots"].get(orb_snapshot_id)
+        mode = data["project_snapshot_modes"].get(orb_snapshot_id, "disk")
+        return ckpt, mode
 
     def all_project_snapshots(self) -> dict[str, str]:
         return dict(self._read()["project_snapshots"])
 
-    def set_project_snapshot(self, orb_snapshot_id: str, checkpoint_id: str) -> None:
+    def all_project_snapshot_modes(self) -> dict[str, str]:
+        return dict(self._read()["project_snapshot_modes"])
+
+    def set_project_snapshot(
+        self, orb_snapshot_id: str, checkpoint_id: str, *, mode: str = "disk"
+    ) -> str | None:
         with self._mutate() as data:
+            previous = data["project_snapshots"].get(orb_snapshot_id)
             data["project_snapshots"][orb_snapshot_id] = checkpoint_id
+            data["project_snapshot_modes"][orb_snapshot_id] = mode
+            return previous
 
     def remove_project_snapshot(self, orb_snapshot_id: str) -> None:
         with self._mutate() as data:
             data["project_snapshots"].pop(orb_snapshot_id, None)
+            data["project_snapshot_modes"].pop(orb_snapshot_id, None)
 
     # --- Per-orb pause/GPU recovery checkpoints (ORB_ID -> checkpoint_id) ---
     def get_orb_checkpoint(self, orb_id: str) -> str | None:
@@ -116,6 +141,10 @@ class SnapshotStore:
         with self._mutate() as data:
             data["orb_sandboxes"][orb_id] = sandbox_id
 
+    def replace_orb_sandboxes(self, mapping: dict[str, str]) -> None:
+        with self._mutate() as data:
+            data["orb_sandboxes"] = dict(mapping)
+
     def remove_orb_sandbox(self, orb_id: str) -> None:
         with self._mutate() as data:
             data["orb_sandboxes"].pop(orb_id, None)
@@ -137,36 +166,89 @@ class SnapshotStore:
         with self._mutate() as data:
             data["warm_templates"].pop(key, None)
 
+    # --- Standby pool sandboxes (standby_key -> comma-separated sandbox_ids) ---
+    def get_standby_ids(self, key: str) -> list[str]:
+        raw = self._read()["standby_sandboxes"].get(key, "")
+        return [item for item in raw.split(",") if item]
+
+    def all_standby_ids(self) -> dict[str, list[str]]:
+        return {
+            key: [item for item in raw.split(",") if item]
+            for key, raw in self._read()["standby_sandboxes"].items()
+            if raw
+        }
+
+    def set_standby_ids(self, key: str, sandbox_ids: list[str]) -> None:
+        deduped = list(dict.fromkeys(s for s in sandbox_ids if s))
+        with self._mutate() as data:
+            if deduped:
+                data["standby_sandboxes"][key] = ",".join(deduped)
+            else:
+                data["standby_sandboxes"].pop(key, None)
+
+    def referenced_checkpoint_ids(self) -> set[str]:
+        """Return every checkpoint ID currently referenced across snapshots, orbs, or templates."""
+        data = self._read()
+        return (
+            set(data["project_snapshots"].values())
+            | set(data["orb_checkpoints"].values())
+            | set(data["warm_templates"].values())
+        )
+
     def _empty(self) -> dict[str, dict[str, str]]:
         return {section: {} for section in _STORE_SECTIONS}
 
     def _read(self) -> dict[str, dict[str, str]]:
-        if not self.path.is_file():
-            return self._empty()
-        with acquire_file_lock(self._lock_path, timeout_seconds=30.0):
-            return self._read_unlocked()
-
-    def _read_unlocked(self) -> dict[str, dict[str, str]]:
-        if not self.path.is_file():
-            return self._empty()
         try:
-            raw: Any = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            st = self.path.stat()
+        except FileNotFoundError:
+            with _CACHE_LOCK:
+                _MEMORY_CACHE.pop(self._resolved_path, None)
+            return self._empty()
+
+        with _CACHE_LOCK:
+            cached = _MEMORY_CACHE.get(self._resolved_path)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                return cached[2]
+
+        with acquire_file_lock(self._lock_path, timeout_seconds=30.0):
+            return self._read_unlocked_and_cache()
+
+    def _read_unlocked_and_cache(self) -> dict[str, dict[str, str]]:
+        try:
+            st = self.path.stat()
+            raw_text = self.path.read_text(encoding="utf-8")
+        except OSError:
+            with _CACHE_LOCK:
+                _MEMORY_CACHE.pop(self._resolved_path, None)
+            return self._empty()
+
+        try:
+            raw: Any = json.loads(raw_text)
+        except json.JSONDecodeError:
             return self._empty()
         if not isinstance(raw, dict):
             return self._empty()
+
         parsed = self._empty()
         for section in _STORE_SECTIONS:
             value = raw.get(section)
             if isinstance(value, dict):
                 parsed[section] = {str(k): str(v) for k, v in value.items()}
+
+        with _CACHE_LOCK:
+            _MEMORY_CACHE[self._resolved_path] = (
+                st.st_mtime_ns,
+                st.st_size,
+                copy.deepcopy(parsed),
+            )
         return parsed
 
     @contextlib.contextmanager
     def _mutate(self) -> Iterator[dict[str, dict[str, str]]]:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         with acquire_file_lock(self._lock_path, timeout_seconds=30.0):
-            data = self._read_unlocked()
+            data = self._read_unlocked_and_cache()
             yield data
             fd, tmp_name = tempfile.mkstemp(
                 dir=str(self.state_dir), prefix=".snapshots.", suffix=".tmp"
@@ -179,6 +261,13 @@ class SnapshotStore:
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(tmp_name, self.path)
+                st = self.path.stat()
+                with _CACHE_LOCK:
+                    _MEMORY_CACHE[self._resolved_path] = (
+                        st.st_mtime_ns,
+                        st.st_size,
+                        copy.deepcopy(data),
+                    )
             except BaseException:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_name)

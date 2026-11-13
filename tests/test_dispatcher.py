@@ -443,10 +443,10 @@ def test_project_snapshots_survive_source_thread_deletion_and_boot_arm64(tmp_pat
     store = SnapshotStore(tmp_path)
     shared_ckpt_id = store.get_project_snapshot("snap-v1")
     assert shared_ckpt_id is not None
-    assert backend.checkpoints[shared_ckpt_id]["expires_at"] is not None  # 96h TTL applied
+    # Single-checkpoint pause: pause() created exactly 1 checkpoint reused for both orb & snapshot!
+    assert len(backend.checkpoints) == 1
 
-    # Deleting Thread A must delete Thread A's private pause checkpoint,
-    # while KEEPING shared project snapshot `shared_ckpt_id` for future threads!
+    # Deleting Thread A must KEEP shared project snapshot `shared_ckpt_id` for future threads!
     _run(backend, tmp_path, {"ORB_OPERATION": "delete", "ORB_ID": "amp-thread-A"})
     assert shared_ckpt_id in backend.checkpoints
     assert len(backend.checkpoints) == 1
@@ -717,5 +717,88 @@ def test_warm_memory_template_forks_with_restore_memory_and_survives_thread_dele
     cold_fallback = backend.create_requests[-1]
     assert cold_fallback.checkpoint_id is None
     assert cold_fallback.docker_image == "prime/xeophon/amp-orb:latest"
+
+
+def test_project_snapshot_memory_promotion_and_custom_orb_type_shape_fallback(
+    tmp_path: Path,
+) -> None:
+    from prime_orbs.dispatcher import expire_stale_project_snapshots
+    from prime_orbs.standby import SnapshotPromoter
+
+    backend = FakePrimeBackend()
+    store = SnapshotStore(tmp_path)
+    cfg = ProviderConfig.from_env({"PRIME_ORB_STATE_DIR": str(tmp_path)})
+    promoter = SnapshotPromoter(cfg, backend, store)  # type: ignore[arg-type]
+
+    try:
+        # 1. Thread A spawns and pauses with ORB_SNAPSHOT_ID="snap-promo"
+        _run(
+            backend,
+            tmp_path,
+            {"ORB_OPERATION": "spawn", "ORB_ID": "amp-src", "ORB_TOKEN": "tok-src"},
+        )
+        _run(
+            backend,
+            tmp_path,
+            {"ORB_OPERATION": "pause", "ORB_ID": "amp-src", "ORB_SNAPSHOT_ID": "snap-promo"},
+        )
+        disk_ckpt, initial_mode = store.get_project_snapshot_entry("snap-promo")
+        assert disk_ckpt is not None
+        assert initial_mode == "disk"
+
+        # 2. Background promoter converts disk_ckpt -> clean restore_memory=True checkpoint
+        promoted_ckpt = promoter.promote_now("snap-promo", disk_ckpt, cfg.default_spec)
+        assert promoted_ckpt is not None and promoted_ckpt != disk_ckpt
+        saved_ckpt, saved_mode = store.get_project_snapshot_entry("snap-promo")
+        assert saved_ckpt == promoted_ckpt
+        assert saved_mode == "memory:4:8"
+
+        # 3. Default-sized Thread B forks with restore_memory=True!
+        _run(
+            backend,
+            tmp_path,
+            {
+                "ORB_OPERATION": "spawn",
+                "ORB_ID": "amp-dst-default",
+                "ORB_TOKEN": "tok-b",
+                "ORB_SNAPSHOT_ID": "snap-promo",
+            },
+        )
+        default_req = backend.create_requests[-1]
+        assert default_req.checkpoint_id == promoted_ckpt
+        assert default_req.restore_memory is True
+
+        # 4. Larger ORB_TYPE="large" (16 vCPU, 32 GiB) safely cold-boots the same checkpoint
+        #    so it gets 16 vCPUs / 32 GiB instead of failing Prime's memory-shape check!
+        _run(
+            backend,
+            tmp_path,
+            {
+                "ORB_OPERATION": "spawn",
+                "ORB_ID": "amp-dst-large",
+                "ORB_TOKEN": "tok-c",
+                "ORB_TYPE": "large",
+                "ORB_SNAPSHOT_ID": "snap-promo",
+            },
+        )
+        large_req = backend.create_requests[-1]
+        assert large_req.checkpoint_id == promoted_ckpt
+        assert not large_req.restore_memory
+        assert large_req.cpu_cores == 16.0
+        assert large_req.memory_gb == 32.0
+
+        # 5. TTL expiry cleans up aged-out project snapshots
+        backend.checkpoints[promoted_ckpt]["created_at"] = "2026-11-01T00:00:00+00:00"
+        expired = expire_stale_project_snapshots(
+            backend,  # type: ignore[arg-type]
+            store,
+            ttl_seconds=96 * 3600,
+        )
+        assert expired == 1
+        assert store.get_project_snapshot("snap-promo") is None
+        assert promoted_ckpt not in backend.checkpoints
+    finally:
+        promoter.close()
+
 
 

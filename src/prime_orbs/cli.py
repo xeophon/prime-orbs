@@ -26,6 +26,7 @@ from .dispatcher import (
     ORB_MANAGED_LABEL,
     TERMINAL_STATUSES,
     build_warm_template,
+    expire_stale_project_snapshots,
     run_dispatch,
     warm_template_key,
 )
@@ -36,6 +37,7 @@ from .images import (
     format_prime_image_ref,
     resolve_prime_image,
 )
+from .standby import ORB_STANDBY_LABEL
 from .state import SnapshotStore
 
 
@@ -178,10 +180,35 @@ def cmd_status(_args: argparse.Namespace) -> int:
         for key, ckpt_id in sorted(warm_templates.items()):
             print(f"  - {key} -> {ckpt_id}")
 
-    sandboxes_resp = sandbox_client.list(labels=[ORB_MANAGED_LABEL], per_page=100)
-    live_sandboxes = [
-        sbx for sbx in sandboxes_resp.sandboxes if sbx.status not in TERMINAL_STATUSES
+    claimed_ids = set(store.all_orb_sandboxes().values())
+    standby_resp = sandbox_client.list(labels=[ORB_STANDBY_LABEL], per_page=100)
+    standby_live = [
+        sbx
+        for sbx in standby_resp.sandboxes
+        if sbx.id not in claimed_ids and sbx.status not in TERMINAL_STATUSES
     ]
+    print(f"\nPre-Placed Standby Sandboxes ({len(standby_live)}):")
+    if not standby_live:
+        print("  (none)")
+    else:
+        for sbx in standby_live:
+            print(f"  - {sbx.name} ({sbx.id}): {sbx.status} | image={sbx.docker_image}")
+
+    sandboxes_resp = sandbox_client.list(labels=[ORB_MANAGED_LABEL], per_page=100)
+    live_by_id = {
+        sbx.id: sbx for sbx in sandboxes_resp.sandboxes if sbx.status not in TERMINAL_STATUSES
+    }
+    for orb_id, sbx_id in store.all_orb_sandboxes().items():
+        if sbx_id not in live_by_id:
+            try:
+                sbx = sandbox_client.get(sbx_id)
+                if sbx.status not in TERMINAL_STATUSES:
+                    live_by_id[sbx_id] = sbx
+            except APIError:
+                pass
+        del orb_id
+
+    live_sandboxes = list(live_by_id.values())
     print(f"\nActive/Paused Amp Orb Sandboxes ({len(live_sandboxes)}):")
     if not live_sandboxes:
         print("  (none)")
@@ -197,9 +224,11 @@ def cmd_status(_args: argparse.Namespace) -> int:
             )
 
     snapshots = store.all_project_snapshots()
+    modes = store.all_project_snapshot_modes()
     print(f"\nCached Project Snapshots ({len(snapshots)}) in {store.path}:")
     for snap_id, ckpt_id in sorted(snapshots.items()):
-        print(f"  - {snap_id} -> {ckpt_id}")
+        mode = modes.get(snap_id, "disk")
+        print(f"  - {snap_id} -> {ckpt_id} [{mode}]")
 
     return 0
 
@@ -210,7 +239,11 @@ def cmd_gc_snapshots(_args: argparse.Namespace) -> int:
     config = ProviderConfig.from_env()
     store = SnapshotStore(config.state_dir)
 
-    removed = 0
+    removed = expire_stale_project_snapshots(
+        sandbox_client,
+        store,
+        ttl_seconds=config.snapshot_ttl_seconds,
+    )
     for snap_id, ckpt_id in store.all_project_snapshots().items():
         try:
             ckpt = sandbox_client.get_checkpoint(ckpt_id)
@@ -292,6 +325,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     env = dict(os.environ)
     env.setdefault("ORB_IMAGE", resolved_image)
+    if args.standby_count is not None:
+        env["PRIME_ORB_STANDBY_COUNT"] = str(args.standby_count)
+    if args.standby_hot_seconds is not None:
+        env["PRIME_ORB_STANDBY_HOT_SECONDS"] = str(args.standby_hot_seconds)
 
     cmd = [amp_bin, "orb", "provider"]
     if args.token:
@@ -471,6 +508,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--warm-template",
         action="store_true",
         help="Ensure a warm memory-fork checkpoint exists on startup before accepting jobs",
+    )
+    sub_run.add_argument(
+        "--standby-count",
+        type=int,
+        default=None,
+        help="Number of pre-placed standby VMs to maintain (default: PRIME_ORB_STANDBY_COUNT or 1)",
+    )
+    sub_run.add_argument(
+        "--standby-hot-seconds",
+        type=float,
+        default=None,
+        help="Seconds standby VMs stay RUNNING after activity before auto-pausing (default: 900)",
     )
     sub_run.add_argument(
         "--no-daemon",

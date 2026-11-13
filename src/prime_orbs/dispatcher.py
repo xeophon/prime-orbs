@@ -72,6 +72,8 @@ sync
 """
 
 LogFn = Callable[[str], None]
+StandbyClaimFn = Callable[[str, OrbSpec, float, LogFn], Sandbox | None]
+SnapshotSavedFn = Callable[[str, str, OrbSpec], None]
 
 
 def default_log(message: str) -> None:
@@ -95,6 +97,10 @@ def warm_template_key(resolved_image: str, spec: OrbSpec) -> str:
         f"{resolved_image}|cpu={spec.cpu_cores:g}|mem={spec.memory_gb:g}"
         f"|disk={spec.disk_size_gb:g}|arch={arch}"
     )
+
+
+def snapshot_memory_mode(spec: OrbSpec) -> str:
+    return f"memory:{spec.cpu_cores:g}:{spec.memory_gb:g}"
 
 
 def _aware_utc(ts: datetime) -> datetime:
@@ -140,6 +146,58 @@ def _is_retryable_bootstrap_error(exc: BaseException) -> bool:
     return isinstance(exc, (APIError, CommandTimeoutError))
 
 
+def _extract_orb_id_from_labels(sandbox: Sandbox) -> str | None:
+    prefix = "amp-orb:"
+    for label in sandbox.labels:
+        if label.startswith(prefix) and len(label) > len(prefix):
+            return label[len(prefix) :]
+    return None
+
+
+def sync_known_orbs(
+    client: SandboxClient,
+    store: SnapshotStore,
+    *,
+    log_fn: LogFn = default_log,
+) -> dict[str, str]:
+    """Reconcile `store.orb_sandboxes` once on daemon startup for O(0)-GET new-thread checks."""
+    reconciled: dict[str, str] = {}
+
+    # 1. Preserve any persisted orb_id -> sandbox_id mappings (including claimed standby VMs).
+    for orb_id, sbx_id in store.all_orb_sandboxes().items():
+        with contextlib.suppress(APIError):
+            sbx = client.get(sbx_id)
+            if sbx.status not in TERMINAL_STATUSES:
+                reconciled[orb_id] = sbx.id
+
+    # 2. Discover any labeled `amp-orb` sandboxes created outside local state.
+    by_orb: dict[str, list[Sandbox]] = {}
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    while True:
+        page = client.list(labels=[ORB_MANAGED_LABEL], per_page=100, cursor=cursor)
+        for sbx in page.sandboxes:
+            if sbx.status in TERMINAL_STATUSES:
+                continue
+            orb_id = _extract_orb_id_from_labels(sbx)
+            if orb_id:
+                by_orb.setdefault(orb_id, []).append(sbx)
+        if not page.has_next or not page.next_cursor or page.next_cursor in seen_cursors:
+            break
+        seen_cursors.add(page.next_cursor)
+        cursor = page.next_cursor
+
+    for orb_id, items in by_orb.items():
+        items.sort(key=lambda s: _aware_utc(s.created_at), reverse=True)
+        reconciled[orb_id] = items[0].id
+        for extra in items[1:]:
+            log_fn(f"Deleting duplicate active sandbox {extra.id} for {orb_id}")
+            _safe_delete_sandbox(client, extra.id)
+
+    store.replace_orb_sandboxes(reconciled)
+    return reconciled
+
+
 def list_sandboxes_for_orb(
     client: SandboxClient, orb_id: str
 ) -> tuple[list[Sandbox], list[Sandbox]]:
@@ -172,8 +230,10 @@ def _resolve_existing_orb_sandbox(
     store: SnapshotStore,
     orb_id: str,
     log: LogFn,
+    *,
+    authoritative_index: bool = False,
 ) -> tuple[Sandbox | None, list[Sandbox]]:
-    """Fast-path lookup via cached `orb_id -> sandbox_id` (1 GET), falling back to label search."""
+    """Fast-path lookup via cached `orb_id -> sandbox_id` (0 GETs when brand-new in daemon)."""
     cached_id = store.get_orb_sandbox(orb_id)
     if cached_id:
         try:
@@ -186,6 +246,11 @@ def _resolve_existing_orb_sandbox(
             if "HTTP 404" not in str(exc) and "not found" not in str(exc).lower():
                 raise
             store.remove_orb_sandbox(orb_id)
+            if authoritative_index:
+                return None, []
+
+    if authoritative_index:
+        return None, []
 
     active, terminated = list_sandboxes_for_orb(client, orb_id)
     for extra in active[1:]:
@@ -206,6 +271,9 @@ def run_dispatch(
     sandbox_client: SandboxClient | None = None,
     image_client: ImageClient | None = None,
     log_fn: LogFn = default_log,
+    authoritative_index: bool = False,
+    standby_claim_fn: StandbyClaimFn | None = None,
+    on_snapshot_saved: SnapshotSavedFn | None = None,
 ) -> None:
     """Execute one `spawn`, `pause`, or `delete` job against Prime Sandboxes."""
     deadline = time.monotonic() + config.dispatch_timeout_seconds
@@ -224,9 +292,28 @@ def run_dispatch(
 
     with orb_lock(config.state_dir, job.orb_id, timeout_seconds=_remaining(deadline)):
         if job.operation == "spawn":
-            _handle_spawn(job, config, sandbox_client, image_client, store, deadline, log_fn)
+            _handle_spawn(
+                job,
+                config,
+                sandbox_client,
+                image_client,
+                store,
+                deadline,
+                log_fn,
+                authoritative_index=authoritative_index,
+                standby_claim_fn=standby_claim_fn,
+            )
         elif job.operation == "pause":
-            _handle_pause(job, config, sandbox_client, store, deadline, log_fn)
+            _handle_pause(
+                job,
+                config,
+                sandbox_client,
+                store,
+                deadline,
+                log_fn,
+                authoritative_index=authoritative_index,
+                on_snapshot_saved=on_snapshot_saved,
+            )
         elif job.operation == "delete":
             _handle_delete(job, sandbox_client, store, deadline, log_fn)
         else:
@@ -241,9 +328,14 @@ def _handle_spawn(
     store: SnapshotStore,
     deadline: float,
     log: LogFn,
+    *,
+    authoritative_index: bool = False,
+    standby_claim_fn: StandbyClaimFn | None = None,
 ) -> None:
     spec = config.resolve_spec(job)
-    candidate, terminated = _resolve_existing_orb_sandbox(client, store, job.orb_id, log)
+    candidate, terminated = _resolve_existing_orb_sandbox(
+        client, store, job.orb_id, log, authoritative_index=authoritative_index
+    )
 
     running_sandbox: Sandbox | None = None
     if candidate is not None:
@@ -263,6 +355,7 @@ def _handle_spawn(
             terminated=terminated,
             deadline=deadline,
             log=log,
+            standby_claim_fn=standby_claim_fn,
         )
         store.set_orb_sandbox(job.orb_id, running_sandbox.id)
 
@@ -486,6 +579,7 @@ def _create_orb_sandbox(
     terminated: list[Sandbox],
     deadline: float,
     log: LogFn,
+    standby_claim_fn: StandbyClaimFn | None = None,
 ) -> Sandbox:
     generation = len(terminated)
 
@@ -510,10 +604,12 @@ def _create_orb_sandbox(
 
     # 2. Boot from shared Amp project snapshot (ORB_SNAPSHOT_ID) when available.
     if config.snapshots_enabled and job.orb_snapshot_id:
-        mapped_ckpt = store.get_project_snapshot(job.orb_snapshot_id)
+        mapped_ckpt, snap_mode = store.get_project_snapshot_entry(job.orb_snapshot_id)
         if mapped_ckpt:
+            use_memory = snap_mode == snapshot_memory_mode(spec) and spec.gpu_count == 0
+            kind_desc = "memory-promoted" if use_memory else "disk"
             log(
-                f"Creating {job.orb_id} from project snapshot "
+                f"Creating {job.orb_id} from {kind_desc} project snapshot "
                 f"{job.orb_snapshot_id} (checkpoint {mapped_ckpt})"
             )
             try:
@@ -524,6 +620,7 @@ def _create_orb_sandbox(
                         spec=spec,
                         generation=generation,
                         checkpoint_id=mapped_ckpt,
+                        restore_memory=use_memory,
                     )
                 )
                 return _poll_until_running(client, created, deadline)
@@ -536,7 +633,13 @@ def _create_orb_sandbox(
 
     resolved_image = resolve_prime_image(spec.image, image_client, deadline=deadline)
 
-    # 3. Fork from a pre-booted warm memory checkpoint (`restore_memory=True`) when available.
+    # 3. Claim a pre-placed RUNNING/PAUSED VM from the daemon's adaptive standby pool.
+    if standby_claim_fn is not None and spec.gpu_count == 0:
+        claimed = standby_claim_fn(resolved_image, spec, deadline, log)
+        if claimed is not None:
+            return claimed
+
+    # 4. Fork from a pre-booted warm memory checkpoint (`restore_memory=True`) when available.
     if config.warm_template_enabled and spec.gpu_count == 0:
         tmpl_key = warm_template_key(resolved_image, spec)
         warm_ckpt = store.get_warm_template(tmpl_key)
@@ -561,7 +664,7 @@ def _create_orb_sandbox(
                 )
                 store.remove_warm_template(tmpl_key)
 
-    # 4. Cold boot from resolved Prime/Docker Hub image.
+    # 5. Cold boot from resolved Prime/Docker Hub image.
     log(
         f"Creating {job.orb_id} from image {resolved_image} "
         f"({spec.cpu_cores:g} vCPU, {spec.memory_gb:g} GiB RAM, {spec.disk_size_gb:g} GiB disk)"
@@ -619,7 +722,6 @@ def _execute_when_gateway_ready(
             attempt += 1
             if (deadline - time.monotonic()) <= 0.25:
                 break
-            # After the first missed attempt on a resumed sandbox, refresh gateway coordinates.
             if attempt >= 2:
                 _invalidate_gateway_auth(client, sandbox_id)
                 with contextlib.suppress(APIError):
@@ -739,12 +841,10 @@ def build_warm_template(
             sandbox_client.delete(created.id)
 
     previous_ckpt = store.set_warm_template(key, durable.id)
-    if previous_ckpt and previous_ckpt != durable.id:
-        protected = set(store.all_project_snapshots().values()) | set(
-            store.all_warm_templates().values()
-        )
-        if previous_ckpt not in protected:
-            _safe_delete_checkpoint(sandbox_client, previous_ckpt, deadline)
+    if previous_ckpt and previous_ckpt != durable.id and (
+        previous_ckpt not in store.referenced_checkpoint_ids()
+    ):
+        _safe_delete_checkpoint(sandbox_client, previous_ckpt, deadline)
 
     log_fn(f"Saved warm memory checkpoint {durable.id} for {key}")
     return key, durable.id
@@ -776,6 +876,54 @@ def _poll_until_paused(
         time.sleep(min(_fast_poll_delay(time.monotonic() - started), remaining))
 
 
+def _record_project_snapshot_from_checkpoint(
+    *,
+    orb_snapshot_id: str,
+    checkpoint_id: str,
+    sandbox: Sandbox,
+    config: ProviderConfig,
+    client: SandboxClient,
+    store: SnapshotStore,
+    deadline: float,
+    log: LogFn,
+    on_snapshot_saved: SnapshotSavedFn | None,
+) -> None:
+    existing_ckpt, existing_mode = store.get_project_snapshot_entry(orb_snapshot_id)
+    if existing_ckpt and _get_durable_checkpoint_id(client, existing_ckpt):
+        if existing_mode == "disk" and on_snapshot_saved is not None:
+            snap_spec = replace(
+                config.default_spec,
+                cpu_cores=sandbox.cpu_cores,
+                memory_gb=sandbox.memory_gb,
+                disk_size_gb=sandbox.disk_size_gb,
+                gpu_count=sandbox.gpu_count,
+                gpu_type=sandbox.gpu_type,
+                region=sandbox.region,
+            )
+            on_snapshot_saved(orb_snapshot_id, existing_ckpt, snap_spec)
+        return
+
+    durable = client.wait_for_checkpoint(
+        checkpoint_id, timeout_seconds=_remaining(deadline, floor=5.0)
+    )
+    previous = store.set_project_snapshot(orb_snapshot_id, durable.id, mode="disk")
+    if previous and previous != durable.id and previous not in store.referenced_checkpoint_ids():
+        _safe_delete_checkpoint(client, previous, deadline)
+
+    log(f"Saved project snapshot {orb_snapshot_id} -> checkpoint {durable.id}")
+    if on_snapshot_saved is not None and sandbox.gpu_count == 0:
+        snap_spec = replace(
+            config.default_spec,
+            cpu_cores=sandbox.cpu_cores,
+            memory_gb=sandbox.memory_gb,
+            disk_size_gb=sandbox.disk_size_gb,
+            gpu_count=sandbox.gpu_count,
+            gpu_type=sandbox.gpu_type,
+            region=sandbox.region,
+        )
+        on_snapshot_saved(orb_snapshot_id, durable.id, snap_spec)
+
+
 def _handle_pause(
     job: DispatchJob,
     config: ProviderConfig,
@@ -783,8 +931,13 @@ def _handle_pause(
     store: SnapshotStore,
     deadline: float,
     log: LogFn,
+    *,
+    authoritative_index: bool = False,
+    on_snapshot_saved: SnapshotSavedFn | None = None,
 ) -> None:
-    sandbox, _ = _resolve_existing_orb_sandbox(client, store, job.orb_id, log)
+    sandbox, _ = _resolve_existing_orb_sandbox(
+        client, store, job.orb_id, log, authoritative_index=authoritative_index
+    )
     if sandbox is None:
         log(f"No active sandbox for {job.orb_id}; pause is a no-op")
         return
@@ -792,45 +945,46 @@ def _handle_pause(
     if sandbox.status in ("PENDING", "PROVISIONING"):
         sandbox = _poll_until_running(client, sandbox, deadline)
 
-    created_snapshot_ckpt_id: str | None = None
-    if config.snapshots_enabled and job.orb_snapshot_id:
-        existing_snap = store.get_project_snapshot(job.orb_snapshot_id)
-        if existing_snap and _get_durable_checkpoint_id(client, existing_snap):
-            created_snapshot_ckpt_id = existing_snap
-        elif sandbox.status == "RUNNING":
-            log(f"Creating project snapshot {job.orb_snapshot_id} from sandbox {sandbox.id}")
-            ckpt = client.checkpoint(sandbox.id, ttl_seconds=config.snapshot_ttl_seconds)
-            durable = client.wait_for_checkpoint(
-                ckpt.id, timeout_seconds=_remaining(deadline, floor=5.0)
-            )
-            store.set_project_snapshot(job.orb_snapshot_id, durable.id)
-            created_snapshot_ckpt_id = durable.id
-        elif sandbox.status == "PAUSED":
-            checkpoints = client.list_checkpoints(sandbox.id)
-            if checkpoints:
-                durable = client.wait_for_checkpoint(
-                    checkpoints[-1].id, timeout_seconds=_remaining(deadline, floor=5.0)
-                )
-                store.set_project_snapshot(job.orb_snapshot_id, durable.id)
-                created_snapshot_ckpt_id = durable.id
-        sandbox = client.get(sandbox.id)
+    want_snapshot = bool(config.snapshots_enabled and job.orb_snapshot_id)
 
-    if sandbox.status == "PAUSED" or sandbox.status in TERMINAL_STATUSES:
+    # Already PAUSED: reuse its existing pause checkpoint if a project snapshot was requested.
+    if sandbox.status == "PAUSED":
+        if want_snapshot and job.orb_snapshot_id:
+            ckpt_id = store.get_orb_checkpoint(job.orb_id)
+            if not ckpt_id:
+                checkpoints = client.list_checkpoints(sandbox.id)
+                ckpt_id = checkpoints[-1].id if checkpoints else None
+            if ckpt_id:
+                _record_project_snapshot_from_checkpoint(
+                    orb_snapshot_id=job.orb_snapshot_id,
+                    checkpoint_id=ckpt_id,
+                    sandbox=sandbox,
+                    config=config,
+                    client=client,
+                    store=store,
+                    deadline=deadline,
+                    log=log,
+                    on_snapshot_saved=on_snapshot_saved,
+                )
         return
 
-    # Prime GPU sandboxes cannot pause in memory; checkpoint rootfs and delete compute instead.
+    if sandbox.status in TERMINAL_STATUSES:
+        return
+
+    # Prime GPU sandboxes cannot pause in memory; checkpoint rootfs once and delete compute.
     if sandbox.gpu_count > 0:
         _checkpoint_and_delete_for_pause(
             client=client,
             store=store,
             sandbox=sandbox,
             orb_id=job.orb_id,
-            reusable_checkpoint_id=created_snapshot_ckpt_id,
+            orb_snapshot_id=job.orb_snapshot_id if want_snapshot else None,
             deadline=deadline,
             log=log,
         )
         return
 
+    # Standard CPU VM: a single `pause()` freezes both memory and a cold-bootable disk checkpoint!
     try:
         paused = client.pause(sandbox.id)
     except APIError as exc:
@@ -844,18 +998,37 @@ def _handle_pause(
                 store=store,
                 sandbox=sandbox,
                 orb_id=job.orb_id,
-                reusable_checkpoint_id=created_snapshot_ckpt_id,
+                orb_snapshot_id=job.orb_snapshot_id if want_snapshot else None,
                 deadline=deadline,
                 log=log,
             )
             return
         raise
 
-    if getattr(paused, "checkpoint_id", None):
-        store.set_orb_checkpoint(job.orb_id, paused.checkpoint_id)
+    pause_ckpt_id = getattr(paused, "checkpoint_id", None)
+    if pause_ckpt_id:
+        store.set_orb_checkpoint(job.orb_id, pause_ckpt_id)
 
     _poll_until_paused(client, sandbox.id, paused.error_message, deadline)
     log(f"Paused sandbox {sandbox.id} for {job.orb_id}")
+
+    if want_snapshot and job.orb_snapshot_id:
+        snap_source_ckpt = pause_ckpt_id
+        if not snap_source_ckpt:
+            checkpoints = client.list_checkpoints(sandbox.id)
+            snap_source_ckpt = checkpoints[-1].id if checkpoints else None
+        if snap_source_ckpt:
+            _record_project_snapshot_from_checkpoint(
+                orb_snapshot_id=job.orb_snapshot_id,
+                checkpoint_id=snap_source_ckpt,
+                sandbox=sandbox,
+                config=config,
+                client=client,
+                store=store,
+                deadline=deadline,
+                log=log,
+                on_snapshot_saved=on_snapshot_saved,
+            )
 
 
 def _is_pause_unsupported_error(exc: APIError) -> bool:
@@ -872,7 +1045,7 @@ def _checkpoint_and_delete_for_pause(
     store: SnapshotStore,
     sandbox: Sandbox,
     orb_id: str,
-    reusable_checkpoint_id: str | None,
+    orb_snapshot_id: str | None,
     deadline: float,
     log: LogFn,
 ) -> None:
@@ -881,12 +1054,43 @@ def _checkpoint_and_delete_for_pause(
         ckpt.id, timeout_seconds=_remaining(deadline, floor=5.0)
     )
     store.set_orb_checkpoint(orb_id, durable.id)
+    if orb_snapshot_id:
+        store.set_project_snapshot(orb_snapshot_id, durable.id, mode="disk")
     store.remove_orb_sandbox(orb_id)
     _safe_delete_sandbox(client, sandbox.id)
-    log(
-        f"Checkpointed ({durable.id}) and terminated non-pausable sandbox {sandbox.id} "
-        f"(reusable snapshot={reusable_checkpoint_id})"
-    )
+    log(f"Checkpointed ({durable.id}) and terminated non-pausable sandbox {sandbox.id}")
+
+
+def expire_stale_project_snapshots(
+    client: SandboxClient,
+    store: SnapshotStore,
+    *,
+    ttl_seconds: int | None,
+    log_fn: LogFn = default_log,
+) -> int:
+    """Delete project snapshot checkpoints older than `ttl_seconds` (including memory-promoted)."""
+    if not ttl_seconds or ttl_seconds <= 0:
+        return 0
+    now = datetime.now(UTC)
+    expired = 0
+    deadline = time.monotonic() + 60.0
+
+    for snap_id, ckpt_id in list(store.all_project_snapshots().items()):
+        try:
+            ckpt = client.get_checkpoint(ckpt_id)
+        except APIError:
+            store.remove_project_snapshot(snap_id)
+            expired += 1
+            continue
+
+        age = (now - _aware_utc(ckpt.created_at)).total_seconds()
+        if ckpt.state != "DURABLE" or ckpt.merge == "failed" or age >= ttl_seconds:
+            store.remove_project_snapshot(snap_id)
+            if ckpt_id not in store.referenced_checkpoint_ids():
+                _safe_delete_checkpoint(client, ckpt_id, deadline)
+            log_fn(f"Expired project snapshot {snap_id} (checkpoint {ckpt_id}, age={int(age)}s)")
+            expired += 1
+    return expired
 
 
 def _handle_delete(
@@ -913,14 +1117,11 @@ def _handle_delete(
         log(f"Deleting sandbox {sbx.id} for {job.orb_id}")
         _safe_delete_sandbox(client, sbx.id)
 
-    protected_checkpoints = set(store.all_project_snapshots().values()) | set(
-        store.all_warm_templates().values()
-    )
-    candidate_checkpoint_ids: set[str] = set()
+    store.remove_orb_checkpoint(job.orb_id)
+    store.remove_orb_sandbox(job.orb_id)
 
-    recorded_orb_ckpt = store.get_orb_checkpoint(job.orb_id)
-    if recorded_orb_ckpt and recorded_orb_ckpt not in protected_checkpoints:
-        candidate_checkpoint_ids.add(recorded_orb_ckpt)
+    protected_checkpoints = store.referenced_checkpoint_ids()
+    candidate_checkpoint_ids: set[str] = set()
 
     for sbx in all_sandboxes:
         try:
@@ -932,9 +1133,6 @@ def _handle_delete(
 
     for ckpt_id in sorted(candidate_checkpoint_ids):
         _safe_delete_checkpoint(client, ckpt_id, deadline)
-
-    store.remove_orb_checkpoint(job.orb_id)
-    store.remove_orb_sandbox(job.orb_id)
 
 
 def _safe_delete_sandbox(client: SandboxClient, sandbox_id: str) -> None:

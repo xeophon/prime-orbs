@@ -1,4 +1,4 @@
-"""Warm local UNIX-socket worker keeping Prime HTTP/1.1 & HTTP/2 connection pools hot."""
+"""Warm local UNIX-socket worker hosting connection pools, standby VMs, and snapshot promotion."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import socketserver
+import sys
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,7 +16,9 @@ from pathlib import Path
 from prime_sandboxes import APIClient, ImageClient, SandboxClient
 
 from .config import DispatchJob, ProviderConfig
-from .dispatcher import run_dispatch
+from .dispatcher import default_log, run_dispatch, sync_known_orbs
+from .standby import SnapshotPromoter, StandbyPool
+from .state import SnapshotStore
 
 DAEMON_SOCKET_ENV = "PRIME_ORBS_DAEMON_SOCKET"
 _FORWARDED_ENV_PREFIXES = ("ORB_", "PRIME_ORB_", "AMP_", "PRIME_", "XDG_")
@@ -38,7 +41,7 @@ class _ThreadingUnixStreamServer(socketserver.ThreadingMixIn, socketserver.UnixS
 
 
 class DispatchDaemon:
-    """In-process UNIX-socket server reusing warm Prime API & ConnectRPC transport pools."""
+    """In-process UNIX-socket server reusing warm pools, standby VMs, and snapshot promotion."""
 
     def __init__(
         self,
@@ -47,6 +50,7 @@ class DispatchDaemon:
         base_env: Mapping[str, str] | None = None,
         sandbox_client: SandboxClient | None = None,
         image_client: ImageClient | None = None,
+        enable_standby_worker: bool = True,
     ) -> None:
         self.socket_path = socket_path
         self._base_env = dict(os.environ if base_env is None else base_env)
@@ -56,6 +60,24 @@ class DispatchDaemon:
             image_client = image_client or ImageClient(api_client)
         self.sandbox_client = sandbox_client
         self.image_client = image_client
+        self._enable_standby_worker = enable_standby_worker
+
+        self._base_config = ProviderConfig.from_env(self._base_env)
+        self._store = SnapshotStore(self._base_config.state_dir)
+        self.standby_pool = StandbyPool(
+            self._base_config,
+            self.sandbox_client,
+            self.image_client,
+            self._store,
+            log_fn=default_log,
+        )
+        self.snapshot_promoter = SnapshotPromoter(
+            self._base_config,
+            self.sandbox_client,
+            self._store,
+            log_fn=default_log,
+        )
+        self._authoritative_index = False
         self._server: _ThreadingUnixStreamServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -63,6 +85,18 @@ class DispatchDaemon:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(OSError):
             self.socket_path.unlink()
+
+        try:
+            sync_known_orbs(self.sandbox_client, self._store, log_fn=default_log)
+            self._authoritative_index = True
+        except Exception as exc:
+            default_log(f"Warning: initial orb index sync failed ({exc}); using label fallback")
+            self._authoritative_index = False
+
+        try:
+            self.standby_pool.start(run_background_worker=self._enable_standby_worker)
+        except Exception as exc:
+            default_log(f"Warning: standby pool initialization skipped: {exc}")
 
         daemon = self
 
@@ -86,7 +120,6 @@ class DispatchDaemon:
                     request = json.loads(raw_line.decode("utf-8"))
                     job_overrides = request.get("env") or {}
                     merged_env = dict(daemon._base_env)
-                    # Clear job-scoped vars from base_env before overlaying the incoming job's env.
                     for key in list(merged_env):
                         if key.startswith("ORB_") and key != "ORB_IMAGE":
                             merged_env.pop(key, None)
@@ -95,12 +128,20 @@ class DispatchDaemon:
 
                     job = DispatchJob.from_env(merged_env)
                     config = ProviderConfig.from_env(merged_env)
+                    same_state_dir = (
+                        config.state_dir.resolve() == daemon._base_config.state_dir.resolve()
+                    )
                     run_dispatch(
                         job,
                         config,
                         sandbox_client=daemon.sandbox_client,
                         image_client=daemon.image_client,
                         log_fn=log_fn,
+                        authoritative_index=daemon._authoritative_index and same_state_dir,
+                        standby_claim_fn=daemon.standby_pool.claim if same_state_dir else None,
+                        on_snapshot_saved=(
+                            daemon.snapshot_promoter.submit if same_state_dir else None
+                        ),
                     )
                     send_event({"type": "done", "exit_code": 0})
                 except Exception as exc:
@@ -133,6 +174,8 @@ class DispatchDaemon:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        self.standby_pool.close()
+        self.snapshot_promoter.close()
         with contextlib.suppress(OSError):
             self.socket_path.unlink()
 
@@ -148,15 +191,9 @@ def send_job_to_daemon(
     socket_path: str | Path,
     environ: Mapping[str, str] | None = None,
 ) -> int | None:
-    """Send current ORB_* job to a running DispatchDaemon.
-
-    Returns the integer exit code when handled by the daemon, or None if the daemon
-    socket was unavailable (allowing caller fallback to standalone execution).
-    """
+    """Send current ORB_* job to a running DispatchDaemon."""
     env = os.environ if environ is None else environ
-    forwarded = {
-        k: v for k, v in env.items() if k.startswith(_FORWARDED_ENV_PREFIXES)
-    }
+    forwarded = {k: v for k, v in env.items() if k.startswith(_FORWARDED_ENV_PREFIXES)}
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(str(socket_path))
@@ -171,14 +208,10 @@ def send_job_to_daemon(
             event = json.loads(line)
             kind = event.get("type")
             if kind == "log":
-                import sys
-
                 print(event["line"], file=sys.stderr, flush=True)
             elif kind == "done":
                 err = event.get("error")
                 if err:
-                    import sys
-
                     print(err, file=sys.stderr, flush=True)
                 return int(event.get("exit_code", 1))
     return None
