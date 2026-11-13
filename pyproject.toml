@@ -1,0 +1,36 @@
+[project]
+name = "prime-orbs"
+version = "0.1.0"
+description = "Self-hosted Amp orbs backed by Prime Intellect Sandboxes"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.0",
+    "prime-sandboxes>=0.5.11",
+]
+
+[project.scripts]
+prime-orbs = "prime_orbs.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/prime_orbs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
