@@ -75,8 +75,9 @@ Configure defaults in the `amp orb provider` environment:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PRIME_API_KEY` | `~/.prime/config.json` | Prime Intellect API key |
-| `PRIME_TEAM_ID` | `~/.prime/config.json` | Prime team ID (`""` forces personal scope) |
-| `PRIME_ORB_IMAGE` | `ORB_IMAGE` | Explicit `prime/<owner>/<image>:<tag>` override |
+| `PRIME_TEAM_ID` | `~/.prime/config.json` | Prime team ID for team billing/images/sandboxes (`""` forces personal scope) |
+| `PRIME_ORB_TEAM_ID` | `PRIME_TEAM_ID` | Provider-specific Prime team ID override (`""` forces personal scope) |
+| `PRIME_ORB_IMAGE` | `ORB_IMAGE` | Explicit `prime/<owner-or-team>/<image>:<tag>` override |
 | `PRIME_ORB_CPU_CORES` | `4` | Default vCPUs per orb (`1`–`16`) |
 | `PRIME_ORB_MEMORY_GB` | `8` | Default RAM in GiB (`0.125`–`64`) |
 | `PRIME_ORB_DISK_SIZE_GB` | `20` | Default root disk in GiB (`2`–`128`) |
@@ -97,6 +98,24 @@ Configure defaults in the `amp orb provider` environment:
 | `PRIME_ORB_STATE_DIR` | `~/.local/state/prime-orbs` | Local directory for per-orb locks and `ORB_SNAPSHOT_ID` mappings |
 | `PRIME_ORB_DISPATCH_TIMEOUT_SECONDS` | `270` | Per-invocation deadline (under Amp's 300s dispatch limit) |
 | `PRIME_ORB_TYPES` | built-in presets | JSON object or path to JSON file defining/overriding `ORB_TYPE` specs |
+
+### Team & Workspace Scope
+
+To bill sandboxes, Prime Images, and checkpoints to a **Prime Team** (instead of your personal Prime wallet), set `PRIME_TEAM_ID=<team_id>` in your environment file or pass `--team-id <team_id>` (pass `--personal` or `PRIME_TEAM_ID=""` to force personal scope even when `~/.prime/config.json` has a team selected):
+
+```bash copy Copy Team Scope Setup
+export PRIME_API_KEY="<your-prime-api-key>"
+export PRIME_TEAM_ID="<your-prime-team-id>"
+export AMP_ORB_PROVIDER_TOKEN="aop_live_..."
+
+# Build the team VM image (`prime/<team-slug>/amp-orb:latest`) and warm memory template:
+uv run prime-orbs build-image --team-id "$PRIME_TEAM_ID" --warm-template
+
+# Run in team scope (or install systemd units with `--team-id`):
+uv run prime-orbs run --team-id "$PRIME_TEAM_ID" --warm-template
+```
+
+To share the provider across an **Amp Workspace**, register a workspace orb provider in **Workspace Settings → Orbs → Add Orb Provider** (or `amp orb provider create prime --workspace <workspace-slug>`). Warm templates, standby VMs, and `ORB_SNAPSHOT_ID` project snapshots are isolated per scope (`personal` vs `team:<id>`) so switching scopes or defining per-`ORB_TYPE` `"team_id"` overrides in `PRIME_ORB_TYPES` never cross-bills or mixes checkpoints.
 
 ### Orb Types (`ORB_TYPE`)
 

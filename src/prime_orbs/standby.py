@@ -18,7 +18,7 @@ from prime_sandboxes import (
     SandboxClient,
 )
 
-from .config import OrbSpec, ProviderConfig
+from .config import OrbSpec, ProviderConfig, scope_label, sdk_team_param
 from .dispatcher import (
     ORB_TEMPLATE_LABEL,
     TEMPLATE_PREWARM_SCRIPT,
@@ -89,7 +89,9 @@ class SnapshotPromoter:
         self, orb_snapshot_id: str, disk_checkpoint_id: str, spec: OrbSpec
     ) -> str | None:
         try:
-            current_ckpt, current_mode = self._store.get_project_snapshot_entry(orb_snapshot_id)
+            current_ckpt, current_mode = self._store.get_project_snapshot_entry(
+                orb_snapshot_id, team_id=spec.team_id
+            )
             target_mode = snapshot_memory_mode(spec)
             if current_ckpt and current_mode == target_mode:
                 if self._on_promoted is not None:
@@ -103,13 +105,15 @@ class SnapshotPromoter:
                 disk_checkpoint_id, timeout_seconds=max(10.0, deadline - time.monotonic())
             )
             disk_checkpoint_id = durable_disk.id
-            self._store.set_project_snapshot(orb_snapshot_id, disk_checkpoint_id, mode="disk")
+            self._store.set_project_snapshot(
+                orb_snapshot_id, disk_checkpoint_id, mode="disk", team_id=spec.team_id
+            )
 
             # Step 2: Boot a clean VM from that disk checkpoint, warm `amp` in RAM, and pause it.
             temp_name = f"amp-snap-warm-{int(time.time())}"
             self._log(
-                f"Promoting project snapshot {orb_snapshot_id} ({disk_checkpoint_id}) "
-                "to a bootable memory checkpoint ..."
+                f"Promoting project snapshot {orb_snapshot_id} ({disk_checkpoint_id}, "
+                f"scope={scope_label(spec.team_id)}) to a bootable memory checkpoint ..."
             )
             created = self._client.create(
                 CreateSandboxRequest(
@@ -119,6 +123,7 @@ class SnapshotPromoter:
                     memory_gb=spec.memory_gb,
                     timeout_minutes=30,
                     region=spec.region,
+                    team_id=spec.team_id,
                     labels=[ORB_TEMPLATE_LABEL],
                 )
             )
@@ -142,7 +147,7 @@ class SnapshotPromoter:
                 _safe_delete_sandbox(self._client, created.id)
 
             self._store.set_project_snapshot(
-                orb_snapshot_id, durable.id, mode=target_mode
+                orb_snapshot_id, durable.id, mode=target_mode, team_id=spec.team_id
             )
             if disk_checkpoint_id not in self._store.referenced_checkpoint_ids():
                 _safe_delete_checkpoint(self._client, disk_checkpoint_id, deadline)
@@ -204,7 +209,11 @@ class StandbyPool:
         self._thread: threading.Thread | None = None
 
     def start(self, *, run_background_worker: bool = True) -> None:
-        resolved_image = resolve_prime_image(self._config.default_spec.image, self._image_client)
+        resolved_image = resolve_prime_image(
+            self._config.default_spec.image,
+            self._image_client,
+            team_id=self._config.default_spec.team_id,
+        )
         self._default_image = resolved_image
         self._default_key = warm_template_key(resolved_image, self._config.default_spec)
         self.reconcile()
@@ -237,13 +246,19 @@ class StandbyPool:
 
     def reconcile(self) -> None:
         """Re-adopt live base & project standby VMs across restarts; drain stale/excess ones."""
+        default_team = self._config.default_spec.team_id
+        expected_scope_suffix = f"|scope={scope_label(default_team)}"
         claimed_orb_ids = set(self._store.all_orb_sandboxes().values())
-        valid_snapshots = self._store.all_project_snapshots()
+        valid_snapshots = self._store.all_project_snapshots(team_id=default_team)
         persisted = self._store.all_standby_ids()
         discovered_by_id: dict[str, Sandbox] = {}
 
         for key, ids in persisted.items():
-            if key.startswith("snap:") and len(self._project_targets) < self._max_project_standbys:
+            if (
+                key.startswith("snap:")
+                and key.endswith(expected_scope_suffix)
+                and len(self._project_targets) < self._max_project_standbys
+            ):
                 snap_part = key.split("|", 1)[0].removeprefix("snap:")
                 if snap_part in valid_snapshots:
                     self._project_targets[key] = (snap_part, self._config.default_spec)
@@ -259,7 +274,12 @@ class StandbyPool:
         seen_cursors: set[str] = set()
         with contextlib.suppress(APIError):
             while True:
-                page = self._client.list(labels=[ORB_STANDBY_LABEL], per_page=100, cursor=cursor)
+                page = self._client.list(
+                    team_id=sdk_team_param(default_team),
+                    labels=[ORB_STANDBY_LABEL],
+                    per_page=100,
+                    cursor=cursor,
+                )
                 for sbx in page.sandboxes:
                     if sbx.id not in claimed_orb_ids and sbx.status not in TERMINAL_STATUSES:
                         discovered_by_id[sbx.id] = sbx
@@ -398,18 +418,16 @@ class StandbyPool:
                 self._creating_count[key] = max(0, self._creating_count.get(key, 1) - 1)
 
     def _pick_next_replenish_target(self) -> tuple[str, str | None, OrbSpec] | None:
-        valid_snapshots = self._store.all_project_snapshots()
-        modes = self._store.all_project_snapshot_modes()
-        stale_Ids: list[str] = []
+        stale_ids: list[str] = []
 
         with self._lock:
-            # Prune any project targets whose snapshot expired or is still uploading.
             for proj_key in list(self._project_targets):
-                snap_id, _ = self._project_targets[proj_key]
-                if snap_id not in valid_snapshots:
+                snap_id, spec = self._project_targets[proj_key]
+                ckpt_id, _ = self._store.get_project_snapshot_entry(snap_id, team_id=spec.team_id)
+                if ckpt_id is None:
                     self._project_targets.pop(proj_key, None)
                     for sid, _ in self._pool.pop(proj_key, ()):
-                        stale_Ids.append(sid)
+                        stale_ids.append(sid)
                     self._store.set_standby_ids(proj_key, [])
 
             # 1. Base standby pool first
@@ -434,7 +452,10 @@ class StandbyPool:
             # 2. Most-recently-used ready project snapshots next
             if target is None:
                 for proj_key, (snap_id, spec) in reversed(list(self._project_targets.items())):
-                    if modes.get(snap_id) == "uploading":
+                    ckpt_id, mode = self._store.get_project_snapshot_entry(
+                        snap_id, team_id=spec.team_id
+                    )
+                    if not ckpt_id or mode == "uploading":
                         continue
                     cur = len(self._pool.get(proj_key, ())) + self._creating_count.get(proj_key, 0)
                     if cur < 1:
@@ -444,7 +465,7 @@ class StandbyPool:
                         target = (proj_key, snap_id, spec)
                         break
 
-        for sid in stale_Ids:
+        for sid in stale_ids:
             _safe_delete_sandbox(self._client, sid)
         return target
 
@@ -527,6 +548,7 @@ class StandbyPool:
                         timeout_minutes=spec.timeout_minutes,
                         idle_timeout_minutes=spec.idle_timeout_minutes,
                         region=spec.region,
+                        team_id=spec.team_id,
                         network_allowlist=spec.network_allowlist,
                         network_denylist=spec.network_denylist,
                         labels=labels,
@@ -548,6 +570,7 @@ class StandbyPool:
                     timeout_minutes=spec.timeout_minutes,
                     idle_timeout_minutes=spec.idle_timeout_minutes,
                     region=spec.region,
+                    team_id=spec.team_id,
                     network_allowlist=spec.network_allowlist,
                     network_denylist=spec.network_denylist,
                     labels=labels,
@@ -561,7 +584,9 @@ class StandbyPool:
     ) -> Sandbox | None:
         if spec.gpu_count > 0:
             return None
-        ckpt_id, snap_mode = self._store.get_project_snapshot_entry(orb_snapshot_id)
+        ckpt_id, snap_mode = self._store.get_project_snapshot_entry(
+            orb_snapshot_id, team_id=spec.team_id
+        )
         if not ckpt_id or snap_mode == "uploading":
             return None
 
@@ -576,6 +601,7 @@ class StandbyPool:
             timeout_minutes=spec.timeout_minutes,
             idle_timeout_minutes=spec.idle_timeout_minutes,
             region=spec.region,
+            team_id=spec.team_id,
             network_allowlist=spec.network_allowlist,
             network_denylist=spec.network_denylist,
             labels=labels,
@@ -597,7 +623,7 @@ class StandbyPool:
             self._log(
                 f"Warning: project standby create failed for {orb_snapshot_id} ({exc}); pruning"
             )
-            self._store.remove_project_snapshot(orb_snapshot_id)
+            self._store.remove_project_snapshot(orb_snapshot_id, team_id=spec.team_id)
             return None
 
         return self._finalize_standby_vm(

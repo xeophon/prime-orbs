@@ -20,7 +20,7 @@ from prime_sandboxes import (
     UnauthorizedError,
 )
 
-from .config import DispatchJob, OrbArch, ProviderConfig
+from .config import DispatchJob, OrbArch, ProviderConfig, scope_label, sdk_team_param
 from .daemon import DAEMON_SOCKET_ENV, DispatchDaemon, daemon_socket_path
 from .dispatcher import (
     ORB_MANAGED_LABEL,
@@ -55,6 +55,32 @@ def _repo_root() -> Path:
 
 def _require_clients() -> tuple[APIClient, SandboxClient, ImageClient]:
     return create_tuned_clients(require_api_key=True)
+
+
+def _scoped_env_from_args(args: argparse.Namespace) -> dict[str, str]:
+    env = dict(os.environ)
+    if getattr(args, "personal", False):
+        env["PRIME_ORB_TEAM_ID"] = ""
+        env["PRIME_TEAM_ID"] = ""
+    elif getattr(args, "team_id", None):
+        tid = str(args.team_id).strip()
+        env["PRIME_ORB_TEAM_ID"] = tid
+        env["PRIME_TEAM_ID"] = tid
+    return env
+
+
+def _add_scope_args(subparser: argparse.ArgumentParser) -> None:
+    group = subparser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--team-id",
+        default=None,
+        help="Prime team ID (overrides PRIME_TEAM_ID and ~/.prime/config.json)",
+    )
+    group.add_argument(
+        "--personal",
+        action="store_true",
+        help="Force personal Prime scope even if PRIME_TEAM_ID or ~/.prime/config.json sets a team",
+    )
 
 
 def cmd_dispatch(_args: argparse.Namespace) -> int:
@@ -95,13 +121,20 @@ def cmd_build_image(args: argparse.Namespace) -> int:
             password=password,
         )
 
+    scoped_env = _scoped_env_from_args(args)
+    scoped_cfg = ProviderConfig.from_env(scoped_env)
+    effective_team_id = scoped_cfg.default_spec.team_id
+
     dockerfile_path = Path(args.dockerfile).resolve() if args.dockerfile else None
     context_dir = Path(args.context).resolve() if args.context else None
     base_image = args.base_image or default_base_image_for_arch(arch)
     destination = args.name or ("amp-orb-arm64:latest" if arch == "arm64" else "amp-orb:latest")
 
     source_desc = str(dockerfile_path) if dockerfile_path else base_image
-    print(f"Building Prime VM image '{destination}' ({arch}) from {source_desc} ...")
+    print(
+        f"Building Prime VM image '{destination}' ({arch}, "
+        f"scope={scope_label(effective_team_id)}) from {source_desc} ..."
+    )
     build_id, image_ref = build_orb_image(
         image_client,
         destination=destination,
@@ -110,7 +143,7 @@ def cmd_build_image(args: argparse.Namespace) -> int:
         context_dir=context_dir,
         arch=arch,
         visibility=visibility,
-        team_id=args.team_id,
+        team_id=effective_team_id,
         registry_auth=registry_auth,
         update_amp_cli=not args.no_update_amp,
         wait=not args.no_wait,
@@ -123,7 +156,7 @@ def cmd_build_image(args: argparse.Namespace) -> int:
         return 0
 
     if args.warm_template:
-        config = ProviderConfig.from_env({**os.environ, "ORB_IMAGE": image_ref})
+        config = ProviderConfig.from_env({**scoped_env, "ORB_IMAGE": image_ref})
         _, ckpt_id = build_warm_template(
             config,
             sandbox_client=sandbox_client,
@@ -138,7 +171,7 @@ def cmd_build_image(args: argparse.Namespace) -> int:
 
 def cmd_warm_template(args: argparse.Namespace) -> int:
     _, sandbox_client, image_client = _require_clients()
-    config = ProviderConfig.from_env()
+    config = ProviderConfig.from_env(_scoped_env_from_args(args))
 
     key, ckpt_id = build_warm_template(
         config,
@@ -152,24 +185,32 @@ def cmd_warm_template(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(_args: argparse.Namespace) -> int:
+def cmd_status(args: argparse.Namespace) -> int:
     api_client, sandbox_client, image_client = _require_clients()
-    config = ProviderConfig.from_env()
+    config = ProviderConfig.from_env(_scoped_env_from_args(args))
     store = SnapshotStore(config.state_dir)
+    team_id = config.default_spec.team_id
+    team_param = sdk_team_param(team_id)
 
-    team_display = api_client.config.team_id or "personal"
-    print(f"Scope: {team_display} ({api_client.config.base_url})")
+    print(f"Scope: {scope_label(team_id)} ({api_client.config.base_url})")
 
-    images = image_client.list(search="amp-orb", limit=50)
+    images = image_client.list(search="amp-orb", team_id=team_param, limit=50)
     print("\nPrime Images matching 'amp-orb':")
     if not images.data:
-        print("  (none built yet — run `uv run prime-orbs build-image`)")
+        team_hint = f" --team-id {team_id}" if team_id else ""
+        print(f"  (none built yet — run `uv run prime-orbs build-image{team_hint}`)")
     else:
         for row in images.data:
             ref = format_prime_image_ref(row)
             print(f"  - {ref} [{row.status.value}] ({row.visibility.value})")
 
-    warm_templates = store.all_warm_templates()
+    expected_scope_suffix = f"|scope={scope_label(team_id)}"
+    warm_templates = {
+        k: v
+        for k, v in store.all_warm_templates().items()
+        if k.endswith(expected_scope_suffix)
+        or (team_id is None and "|scope=" not in k)
+    }
     print(f"\nWarm Memory-Fork Templates ({len(warm_templates)}):")
     if not warm_templates:
         print("  (none — run `uv run prime-orbs warm-template` to skip cold VM kernel boot)")
@@ -178,7 +219,9 @@ def cmd_status(_args: argparse.Namespace) -> int:
             print(f"  - {key} -> {ckpt_id}")
 
     claimed_ids = set(store.all_orb_sandboxes().values())
-    standby_resp = sandbox_client.list(labels=[ORB_STANDBY_LABEL], per_page=100)
+    standby_resp = sandbox_client.list(
+        team_id=team_param, labels=[ORB_STANDBY_LABEL], per_page=100
+    )
     standby_live = [
         sbx
         for sbx in standby_resp.sandboxes
@@ -191,11 +234,15 @@ def cmd_status(_args: argparse.Namespace) -> int:
         for sbx in standby_live:
             print(f"  - {sbx.name} ({sbx.id}): {sbx.status} | image={sbx.docker_image}")
 
-    sandboxes_resp = sandbox_client.list(labels=[ORB_MANAGED_LABEL], per_page=100)
+    sandboxes_resp = sandbox_client.list(
+        team_id=team_param, labels=[ORB_MANAGED_LABEL], per_page=100
+    )
     live_by_id = {
         sbx.id: sbx for sbx in sandboxes_resp.sandboxes if sbx.status not in TERMINAL_STATUSES
     }
     for orb_id, sbx_id in store.all_orb_sandboxes().items():
+        if store.get_orb_team(orb_id) != team_id:
+            continue
         if sbx_id not in live_by_id:
             try:
                 sbx = sandbox_client.get(sbx_id)
@@ -203,7 +250,6 @@ def cmd_status(_args: argparse.Namespace) -> int:
                     live_by_id[sbx_id] = sbx
             except APIError:
                 pass
-        del orb_id
 
     live_sandboxes = list(live_by_id.values())
     print(f"\nActive/Paused Amp Orb Sandboxes ({len(live_sandboxes)}):")
@@ -220,8 +266,8 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 f"image={sbx.docker_image}"
             )
 
-    snapshots = store.all_project_snapshots()
-    modes = store.all_project_snapshot_modes()
+    snapshots = store.all_project_snapshots(team_id=team_id)
+    modes = store.all_project_snapshot_modes(team_id=team_id)
     print(f"\nCached Project Snapshots ({len(snapshots)}) in {store.path}:")
     for snap_id, ckpt_id in sorted(snapshots.items()):
         mode = modes.get(snap_id, "disk")
@@ -230,9 +276,9 @@ def cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_gc_snapshots(_args: argparse.Namespace) -> int:
+def cmd_gc_snapshots(args: argparse.Namespace) -> int:
     _, sandbox_client, _ = _require_clients()
-    config = ProviderConfig.from_env()
+    config = ProviderConfig.from_env(_scoped_env_from_args(args))
     store = SnapshotStore(config.state_dir)
 
     removed = expire_stale_project_snapshots(
@@ -240,14 +286,14 @@ def cmd_gc_snapshots(_args: argparse.Namespace) -> int:
         store,
         ttl_seconds=config.snapshot_ttl_seconds,
     )
-    for snap_id, ckpt_id in store.all_project_snapshots().items():
+    for raw_key, ckpt_id in store.all_project_snapshots(all_scopes=True).items():
         try:
             ckpt = sandbox_client.get_checkpoint(ckpt_id)
             if ckpt.state != "DURABLE" or ckpt.merge == "failed":
-                store.remove_project_snapshot(snap_id)
+                store.remove_raw_project_snapshot_key(raw_key)
                 removed += 1
         except APIError:
-            store.remove_project_snapshot(snap_id)
+            store.remove_raw_project_snapshot_key(raw_key)
             removed += 1
 
     for tmpl_key, ckpt_id in store.all_warm_templates().items():
@@ -286,9 +332,13 @@ def cmd_gc_snapshots(_args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     _, sandbox_client, image_client = _require_clients()
-    config = ProviderConfig.from_env()
+    scoped_env = _scoped_env_from_args(args)
+    config = ProviderConfig.from_env(scoped_env)
+    team_id = config.default_spec.team_id
 
-    resolved_image = resolve_prime_image(config.default_spec.image, image_client)
+    resolved_image = resolve_prime_image(
+        config.default_spec.image, image_client, team_id=team_id
+    )
     amp_bin = shutil.which("amp")
     if not amp_bin:
         print("Error: `amp` CLI not found on PATH.", file=sys.stderr)
@@ -310,14 +360,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             except APIError:
                 needs_build = True
         if needs_build and config.default_spec.gpu_count == 0:
-            env_with_img = {**os.environ, "ORB_IMAGE": resolved_image}
+            env_with_img = {**scoped_env, "ORB_IMAGE": resolved_image}
             build_warm_template(
                 ProviderConfig.from_env(env_with_img),
                 sandbox_client=sandbox_client,
                 image_client=image_client,
             )
 
-    env = dict(os.environ)
+    env = dict(scoped_env)
     env.setdefault("ORB_IMAGE", resolved_image)
     if args.standby_count is not None:
         env["PRIME_ORB_STANDBY_COUNT"] = str(args.standby_count)
@@ -333,8 +383,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd.extend(["--amp-url", args.amp_url])
     cmd.append(str(dispatch_script))
 
+    scope_desc = scope_label(team_id)
     if args.no_daemon:
-        print(f"Starting Amp orb provider with Prime image: {resolved_image}", flush=True)
+        print(
+            f"Starting Amp orb provider (scope={scope_desc}, image={resolved_image})",
+            flush=True,
+        )
         os.execvpe(amp_bin, cmd, env)
         return 0
 
@@ -348,7 +402,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     ):
         print(
             f"Starting Amp orb provider with warm dispatch daemon "
-            f"(image={resolved_image}, socket={sock_path})",
+            f"(scope={scope_desc}, image={resolved_image}, socket={sock_path})",
             flush=True,
         )
         proc = subprocess.Popen(cmd, env=env)
@@ -383,6 +437,8 @@ def cmd_install_service(args: argparse.Namespace) -> int:
         unit_dir=unit_dir,
         service_name=args.service_name,
         standby_count=args.standby_count,
+        team_id=args.team_id,
+        force_personal=args.personal,
         include_refresh_timer=not args.no_refresh_timer,
         refresh_on_calendar=args.refresh_schedule,
     )
@@ -395,7 +451,9 @@ def cmd_install_service(args: argparse.Namespace) -> int:
             print(f"# {units.refresh_timer_path}\n{units.refresh_timer_content}")
         return 0
 
-    created_placeholder = ensure_env_file_placeholder(env_file)
+    created_placeholder = ensure_env_file_placeholder(
+        env_file, team_id=args.team_id, force_personal=args.personal
+    )
     written = write_systemd_units(units)
     for path in written:
         print(f"Wrote {path}")
@@ -466,7 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     visibility_group = sub_build.add_mutually_exclusive_group()
     visibility_group.add_argument("--public", action="store_true", help="Publish image publicly")
     visibility_group.add_argument("--private", action="store_true", help="Keep image private")
-    sub_build.add_argument("--team-id", default=None, help="Explicit Prime team ID")
+    _add_scope_args(sub_build)
     sub_build.add_argument("--registry-server", default=None, help="Private base registry host")
     sub_build.add_argument("--registry-username", default=None, help="Private base registry user")
     sub_build.add_argument(
@@ -512,18 +570,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=600.0,
         help="Seconds allowed for booting, prewarming, and checkpointing (default: 600)",
     )
+    _add_scope_args(sub_warm)
     sub_warm.set_defaults(func=cmd_warm_template)
 
     sub_status = sub.add_parser(
         "status",
         help="Show built Prime orb images, warm templates, active/paused orbs, and snapshots",
     )
+    _add_scope_args(sub_status)
     sub_status.set_defaults(func=cmd_status)
 
     sub_gc = sub.add_parser(
         "gc-snapshots",
         help="Remove expired or deleted checkpoint/sandbox mappings from the local state store",
     )
+    _add_scope_args(sub_gc)
     sub_gc.set_defaults(func=cmd_gc_snapshots)
 
     sub_run = sub.add_parser(
@@ -568,6 +629,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exec `amp orb provider` directly without the in-memory UNIX-socket daemon",
     )
+    _add_scope_args(sub_run)
     sub_run.set_defaults(func=cmd_run)
 
     sub_install = sub.add_parser(
@@ -618,6 +680,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print generated systemd unit contents to stdout without writing files",
     )
+    _add_scope_args(sub_install)
     sub_install.set_defaults(func=cmd_install_service)
 
     return parser

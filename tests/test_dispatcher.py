@@ -59,29 +59,32 @@ class FakePrimeBackend:
         self.invalidated_auth_ids.append(sandbox_id)
 
     # --- ImageClient surface ---
-    def list_images_impl(self, **_kwargs: Any) -> ImageListResponse:
+    def list_images_impl(self, *, team_id: str | None = None, **_kwargs: Any) -> ImageListResponse:
+        owner_slug = f"team-{team_id}" if team_id else "xeophon"
         return ImageListResponse.model_validate(
             {
                 "data": [
                     {
-                        "id": "img-1",
+                        "id": f"img-1-{owner_slug}",
                         "artifactType": "VM_SANDBOX",
                         "imageName": "amp-orb",
                         "imageTag": "latest",
                         "status": "COMPLETED",
                         "visibility": "PRIVATE",
+                        "teamId": team_id or None,
                         "createdAt": "2026-11-11T00:00:00Z",
-                        "displayRef": "prime/xeophon/amp-orb:latest",
+                        "displayRef": f"prime/{owner_slug}/amp-orb:latest",
                     },
                     {
-                        "id": "img-2",
+                        "id": f"img-2-{owner_slug}",
                         "artifactType": "VM_SANDBOX",
                         "imageName": "amp-orb-arm64",
                         "imageTag": "latest",
                         "status": "COMPLETED",
                         "visibility": "PRIVATE",
+                        "teamId": team_id or None,
                         "createdAt": "2026-11-11T00:00:00Z",
-                        "displayRef": "prime/xeophon/amp-orb-arm64:latest",
+                        "displayRef": f"prime/{owner_slug}/amp-orb-arm64:latest",
                     },
                 ],
                 "totalCount": 2,
@@ -93,6 +96,7 @@ class FakePrimeBackend:
     # --- SandboxClient surface ---
     def create(self, request: CreateSandboxRequest) -> Sandbox:
         # Validate wire contract rules enforced by Prime's API:
+        effective_team = request.team_id or None
         if request.checkpoint_id is not None:
             assert request.docker_image is None
             assert request.disk_size_gb is None
@@ -103,7 +107,11 @@ class FakePrimeBackend:
                         shape_field not in request.model_fields_set
                     ), f"Memory restore must omit {shape_field} so paused shape is inherited"
             ckpt = self.checkpoints.get(request.checkpoint_id)
-            if ckpt is None or ckpt["state"] != "DURABLE":
+            if (
+                ckpt is None
+                or ckpt["state"] != "DURABLE"
+                or ckpt.get("team_id") != effective_team
+            ):
                 raise APIError(f"HTTP 404: Checkpoint {request.checkpoint_id} not found")
             docker_image = ckpt["docker_image"]
             disk_size_gb = 20.0
@@ -132,6 +140,7 @@ class FakePrimeBackend:
             "timeoutMinutes": request.timeout_minutes,
             "idleTimeoutMinutes": request.idle_timeout_minutes,
             "labels": list(request.labels),
+            "teamId": effective_team,
             "createdAt": now,
             "updatedAt": now,
             "errorMessage": None,
@@ -142,16 +151,19 @@ class FakePrimeBackend:
     def list(
         self,
         *,
+        team_id: str | None = None,
         labels: list[str] | None = None,
         per_page: int = 50,
         cursor: str | None = None,
         **_kwargs: Any,
     ) -> SandboxListResponse:
         del per_page
+        expected_team = team_id or None
         matching = [
             row
             for row in self.sandboxes.values()
-            if not labels or all(lbl in row["labels"] for lbl in labels)
+            if row.get("teamId") == expected_team
+            and (not labels or all(lbl in row["labels"] for lbl in labels))
         ]
         # Paginate 1 item per page when >1 exists to exercise cursor pagination thoroughly!
         idx = int(cursor) if cursor is not None else 0
@@ -244,6 +256,7 @@ class FakePrimeBackend:
         ckpt = {
             "id": ckpt_id,
             "sandbox_id": sandbox_id,
+            "team_id": self.sandboxes[sandbox_id].get("teamId"),
             "state": "DURABLE",
             "depth": 1,
             "docker_image": self.sandboxes[sandbox_id]["dockerImage"],
@@ -280,14 +293,17 @@ class FakePrimeBackend:
     def list_all_checkpoints(
         self,
         *,
+        team_id: str | None = None,
         sandbox_id: str | None = None,
         states: list[str] | None = None,
         **_kwargs: Any,
     ) -> list[SandboxCheckpoint]:
+        expected_team = team_id or None
         return [
             SandboxCheckpoint.model_validate(c)
             for c in self.checkpoints.values()
-            if (sandbox_id is None or c["sandbox_id"] == sandbox_id)
+            if c.get("team_id") == expected_team
+            and (sandbox_id is None or c["sandbox_id"] == sandbox_id)
             and (states is None or c["state"] in states)
         ]
 
@@ -803,6 +819,119 @@ def test_project_snapshot_memory_promotion_and_custom_orb_type_shape_fallback(
         assert promoted_ckpt not in backend.checkpoints
     finally:
         promoter.close()
+
+
+def test_team_scope_isolation_across_templates_snapshots_standby_and_orb_types(
+    tmp_path: Path,
+) -> None:
+    """Verify personal and team scopes share state_dir safely without cross-billing or 404s."""
+    from prime_orbs.standby import SnapshotPromoter, StandbyPool
+
+    backend = FakePrimeBackend()
+    img_adapter = _ImageClientAdapter(backend)
+    store = SnapshotStore(tmp_path)
+
+    # 1. Build warm templates in BOTH personal and team_alpha scopes on the same state_dir
+    personal_cfg = ProviderConfig.from_env({"PRIME_ORB_STATE_DIR": str(tmp_path)})
+    team_cfg = ProviderConfig.from_env(
+        {"PRIME_ORB_STATE_DIR": str(tmp_path), "PRIME_TEAM_ID": "team_alpha"}
+    )
+    p_key, p_ckpt = build_warm_template(
+        personal_cfg,
+        sandbox_client=backend,  # type: ignore[arg-type]
+        image_client=img_adapter,  # type: ignore[arg-type]
+    )
+    t_key, t_ckpt = build_warm_template(
+        team_cfg,
+        sandbox_client=backend,  # type: ignore[arg-type]
+        image_client=img_adapter,  # type: ignore[arg-type]
+    )
+    assert p_key != t_key
+    assert p_ckpt != t_ckpt
+    assert backend.checkpoints[p_ckpt]["team_id"] is None
+    assert backend.checkpoints[t_ckpt]["team_id"] == "team_alpha"
+
+    # 2. Spawning in team_alpha resolves team image & forks team_alpha's warm checkpoint
+    _run(
+        backend,
+        tmp_path,
+        {
+            "PRIME_TEAM_ID": "team_alpha",
+            "ORB_OPERATION": "spawn",
+            "ORB_ID": "amp-team-1",
+            "ORB_TOKEN": "tok-t1",
+        },
+    )
+    team_req = backend.create_requests[-1]
+    assert team_req.team_id == "team_alpha"
+    assert team_req.checkpoint_id == t_ckpt
+    assert team_req.restore_memory is True
+
+    # 3. Same ORB_SNAPSHOT_ID name ("snap-same") in personal vs team_alpha stays isolated!
+    _run(
+        backend,
+        tmp_path,
+        {"ORB_OPERATION": "spawn", "ORB_ID": "amp-pers-1", "ORB_TOKEN": "tok-p1"},
+    )
+    _run(
+        backend,
+        tmp_path,
+        {"ORB_OPERATION": "pause", "ORB_ID": "amp-pers-1", "ORB_SNAPSHOT_ID": "snap-same"},
+    )
+    _run(
+        backend,
+        tmp_path,
+        {
+            "PRIME_TEAM_ID": "team_alpha",
+            "ORB_OPERATION": "pause",
+            "ORB_ID": "amp-team-1",
+            "ORB_SNAPSHOT_ID": "snap-same",
+        },
+    )
+    pers_snap = store.get_project_snapshot("snap-same", team_id=None)
+    team_snap = store.get_project_snapshot("snap-same", team_id="team_alpha")
+    assert pers_snap is not None and team_snap is not None and pers_snap != team_snap
+
+    promoter = SnapshotPromoter(team_cfg, backend, store)  # type: ignore[arg-type]
+    pool = StandbyPool(team_cfg, backend, img_adapter, store)  # type: ignore[arg-type]
+    try:
+        pool.start(run_background_worker=False)
+        promoted_team_ckpt = promoter.promote_now("snap-same", team_snap, team_cfg.default_spec)
+        assert promoted_team_ckpt is not None
+        assert backend.checkpoints[promoted_team_ckpt]["team_id"] == "team_alpha"
+        pool.register_project_snapshot("snap-same", team_cfg.default_spec)
+
+        base_team_standby = pool.replenish_once()
+        proj_team_standby = pool.replenish_once()
+        assert base_team_standby is not None and base_team_standby.team_id == "team_alpha"
+        assert proj_team_standby is not None and proj_team_standby.team_id == "team_alpha"
+
+        # 4. Per-ORB_TYPE team_id override works even though pause & delete omit ORB_TYPE!
+        mixed_types = '{"team-burst":{"cpu_cores":4,"memory_gb":8,"team_id":"team_beta"}}'
+        _run(
+            backend,
+            tmp_path,
+            {
+                "PRIME_ORB_TYPES": mixed_types,
+                "ORB_OPERATION": "spawn",
+                "ORB_ID": "amp-mixed-orb",
+                "ORB_TOKEN": "tok-m1",
+                "ORB_TYPE": "team-burst",
+            },
+        )
+        assert backend.create_requests[-1].team_id == "team_beta"
+        # Pause & delete have NO ORB_TYPE or PRIME_TEAM_ID in env, yet remember team_beta!
+        _run(
+            backend,
+            tmp_path,
+            {"ORB_OPERATION": "pause", "ORB_ID": "amp-mixed-orb", "ORB_SNAPSHOT_ID": "snap-b"},
+        )
+        assert store.get_project_snapshot("snap-b", team_id="team_beta") is not None
+        _run(backend, tmp_path, {"ORB_OPERATION": "delete", "ORB_ID": "amp-mixed-orb"})
+    finally:
+        pool.close()
+        promoter.close()
+
 
 
 

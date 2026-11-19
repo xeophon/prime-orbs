@@ -20,8 +20,24 @@ def _ca_bundle_bytes() -> bytes:
         return handle.read()
 
 
+class _ExplicitScopeConfigProxy:
+    """Wraps `prime_sandboxes.Config` so `team_id` is never injected implicitly behind `OrbSpec`."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    @property
+    def team_id(self) -> str | None:
+        return None
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
 def tune_api_client(api_client: APIClient) -> APIClient:
     """Replace `APIClient.client` (default 5s keepalive) with a 300s keepalive pool."""
+    if not isinstance(getattr(api_client, "config", None), _ExplicitScopeConfigProxy):
+        api_client.config = _ExplicitScopeConfigProxy(api_client.config)  # type: ignore[assignment]
     old_http = getattr(api_client, "client", None)
     if not isinstance(old_http, httpx.Client):
         return api_client

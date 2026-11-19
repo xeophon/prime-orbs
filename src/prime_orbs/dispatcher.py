@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
         return False
 
 
-from .config import DispatchJob, OrbSpec, ProviderConfig
+from .config import DispatchJob, OrbSpec, ProviderConfig, scope_label, sdk_team_param
 from .images import resolve_prime_image
 from .state import SnapshotStore, orb_lock
 from .transport import create_tuned_clients
@@ -103,12 +103,15 @@ def warm_template_key(resolved_image: str, spec: OrbSpec) -> str:
     arch = spec.arch or "amd64"
     return (
         f"{resolved_image}|cpu={spec.cpu_cores:g}|mem={spec.memory_gb:g}"
-        f"|disk={spec.disk_size_gb:g}|arch={arch}"
+        f"|disk={spec.disk_size_gb:g}|arch={arch}|scope={scope_label(spec.team_id)}"
     )
 
 
 def project_standby_key(orb_snapshot_id: str, spec: OrbSpec) -> str:
-    return f"snap:{orb_snapshot_id}|cpu={spec.cpu_cores:g}|mem={spec.memory_gb:g}"
+    return (
+        f"snap:{orb_snapshot_id}|cpu={spec.cpu_cores:g}|mem={spec.memory_gb:g}"
+        f"|scope={scope_label(spec.team_id)}"
+    )
 
 
 def snapshot_memory_mode(spec: OrbSpec) -> str:
@@ -186,11 +189,13 @@ def sync_known_orbs(
     client: SandboxClient,
     store: SnapshotStore,
     *,
+    team_id: str | None = None,
     log_fn: LogFn = default_log,
 ) -> dict[str, str]:
     """Reconcile `store.orb_sandboxes` once on daemon startup for O(0)-GET new-thread checks."""
     reconciled: dict[str, str] = {}
     states: dict[str, str] = {}
+    teams: dict[str, str | None] = {}
 
     for orb_id, sbx_id in store.all_orb_sandboxes().items():
         with contextlib.suppress(APIError):
@@ -198,12 +203,18 @@ def sync_known_orbs(
             if sbx.status not in TERMINAL_STATUSES:
                 reconciled[orb_id] = sbx.id
                 states[orb_id] = sbx.status
+                teams[orb_id] = sbx.team_id or store.get_orb_team(orb_id)
 
     by_orb: dict[str, list[Sandbox]] = {}
     cursor: str | None = None
     seen_cursors: set[str] = set()
     while True:
-        page = client.list(labels=[ORB_MANAGED_LABEL], per_page=100, cursor=cursor)
+        page = client.list(
+            team_id=sdk_team_param(team_id),
+            labels=[ORB_MANAGED_LABEL],
+            per_page=100,
+            cursor=cursor,
+        )
         for sbx in page.sandboxes:
             if sbx.status in TERMINAL_STATUSES:
                 continue
@@ -219,16 +230,20 @@ def sync_known_orbs(
         items.sort(key=lambda s: _aware_utc(s.created_at), reverse=True)
         reconciled[orb_id] = items[0].id
         states[orb_id] = items[0].status
+        teams[orb_id] = items[0].team_id or team_id
         for extra in items[1:]:
             log_fn(f"Deleting duplicate active sandbox {extra.id} for {orb_id}")
             _safe_delete_sandbox(client, extra.id)
 
-    store.replace_orb_sandboxes(reconciled, states)
+    store.replace_orb_sandboxes(reconciled, states, teams)
     return reconciled
 
 
 def list_sandboxes_for_orb(
-    client: SandboxClient, orb_id: str
+    client: SandboxClient,
+    orb_id: str,
+    *,
+    team_id: str | None = None,
 ) -> tuple[list[Sandbox], list[Sandbox]]:
     """Return `(active, terminated)` sandboxes for `orb_id`, each sorted newest-first."""
     found: list[Sandbox] = []
@@ -238,7 +253,12 @@ def list_sandboxes_for_orb(
     target_label = orb_id_label(orb_id)
 
     while True:
-        page = client.list(labels=[target_label], per_page=100, cursor=cursor)
+        page = client.list(
+            team_id=sdk_team_param(team_id),
+            labels=[target_label],
+            per_page=100,
+            cursor=cursor,
+        )
         for sbx in page.sandboxes:
             if target_label in sbx.labels and sbx.id not in seen_ids:
                 seen_ids.add(sbx.id)
@@ -260,14 +280,18 @@ def _resolve_existing_orb_sandbox(
     orb_id: str,
     log: LogFn,
     *,
+    team_id: str | None = None,
     authoritative_index: bool = False,
 ) -> tuple[Sandbox | None, list[Sandbox]]:
     cached_id = store.get_orb_sandbox(orb_id)
+    effective_team = store.get_orb_team(orb_id) or team_id
     if cached_id:
         try:
             sbx = client.get(cached_id)
             if sbx.status not in TERMINAL_STATUSES:
-                store.set_orb_state(orb_id, sbx.status)
+                store.set_orb_sandbox(
+                    orb_id, sbx.id, status=sbx.status, team_id=sbx.team_id or effective_team
+                )
                 return sbx, []
             store.remove_orb_sandbox(orb_id)
             return None, [sbx]
@@ -281,14 +305,16 @@ def _resolve_existing_orb_sandbox(
     if authoritative_index:
         return None, []
 
-    active, terminated = list_sandboxes_for_orb(client, orb_id)
+    active, terminated = list_sandboxes_for_orb(client, orb_id, team_id=effective_team)
     for extra in active[1:]:
         log(f"Deleting duplicate active sandbox {extra.id} for {orb_id}")
         _safe_delete_sandbox(client, extra.id)
 
     if active:
         chosen = active[0]
-        store.set_orb_sandbox(orb_id, chosen.id, status=chosen.status)
+        store.set_orb_sandbox(
+            orb_id, chosen.id, status=chosen.status, team_id=chosen.team_id or effective_team
+        )
         return chosen, terminated
     return None, terminated
 
@@ -343,7 +369,7 @@ def run_dispatch(
                 on_snapshot_saved=on_snapshot_saved,
             )
         elif job.operation == "delete":
-            _handle_delete(job, sandbox_client, store, deadline, log_fn)
+            _handle_delete(job, config, sandbox_client, store, deadline, log_fn)
         else:
             raise ValueError(f"Unsupported operation: {job.operation!r}")
 
@@ -378,7 +404,12 @@ def _handle_spawn(
         if resumed is not None:
             running_sandbox_id = resumed.id
             acquire_source = "speculative-resume"
-            store.set_orb_sandbox(job.orb_id, resumed.id, status="RUNNING")
+            store.set_orb_sandbox(
+                job.orb_id,
+                resumed.id,
+                status="RUNNING",
+                team_id=resumed.team_id or spec.team_id,
+            )
         else:
             store.remove_orb_sandbox(job.orb_id)
             with contextlib.suppress(APIError):
@@ -387,7 +418,12 @@ def _handle_spawn(
                     terminated.append(dead)
     else:
         candidate, found_terminated = _resolve_existing_orb_sandbox(
-            client, store, job.orb_id, log, authoritative_index=authoritative_index
+            client,
+            store,
+            job.orb_id,
+            log,
+            team_id=spec.team_id,
+            authoritative_index=authoritative_index,
         )
         terminated.extend(found_terminated)
         if candidate is not None:
@@ -396,7 +432,12 @@ def _handle_spawn(
             if ensured is not None:
                 running_sandbox_id = ensured.id
                 acquire_source = "resume" if was_paused else "existing-running"
-                store.set_orb_sandbox(job.orb_id, ensured.id, status="RUNNING")
+                store.set_orb_sandbox(
+                    job.orb_id,
+                    ensured.id,
+                    status="RUNNING",
+                    team_id=ensured.team_id or spec.team_id,
+                )
             else:
                 store.remove_orb_sandbox(job.orb_id)
                 terminated.insert(0, candidate)
@@ -444,7 +485,9 @@ def _handle_spawn(
             )
             boot_ms = int((time.monotonic() - boot_started) * 1000)
             total_ms = int((time.monotonic() - spawn_started) * 1000)
-            store.set_orb_sandbox(job.orb_id, sandbox_id, status="RUNNING")
+            store.set_orb_sandbox(
+                job.orb_id, sandbox_id, status="RUNNING", team_id=spec.team_id
+            )
             log(
                 f"Spawn ready for {job.orb_id} on {sandbox_id} via {acquire_source} "
                 f"(acquire={acquire_ms}ms, bootstrap={boot_ms}ms, total={total_ms}ms)"
@@ -645,6 +688,8 @@ def _find_orb_recovery_checkpoint(
     store: SnapshotStore,
     orb_id: str,
     terminated: list[Sandbox],
+    *,
+    team_id: str | None = None,
 ) -> str | None:
     recorded = store.get_orb_checkpoint(orb_id)
     if recorded:
@@ -656,7 +701,9 @@ def _find_orb_recovery_checkpoint(
     for past in terminated:
         try:
             checkpoints = client.list_all_checkpoints(
-                sandbox_id=past.id, states=["DURABLE"]
+                team_id=sdk_team_param(past.team_id or team_id),
+                sandbox_id=past.id,
+                states=["DURABLE"],
             )
         except APIError:
             continue
@@ -682,6 +729,7 @@ def _build_create_request(
         timeout_minutes=spec.timeout_minutes,
         idle_timeout_minutes=spec.idle_timeout_minutes,
         region=spec.region,
+        team_id=spec.team_id,
         network_allowlist=spec.network_allowlist,
         network_denylist=spec.network_denylist,
         labels=orb_labels(orb_id, orb_type),
@@ -733,7 +781,9 @@ def _acquire_new_orb_sandbox(
     generation = len(terminated)
 
     # 1. Recover this orb's disk if a previous sandbox was checkpointed (GPU pause or lost node).
-    recovery_ckpt = _find_orb_recovery_checkpoint(client, store, job.orb_id, terminated)
+    recovery_ckpt = _find_orb_recovery_checkpoint(
+        client, store, job.orb_id, terminated, team_id=spec.team_id
+    )
     if recovery_ckpt:
         log(f"Restoring {job.orb_id} from orb checkpoint {recovery_ckpt}")
         try:
@@ -753,7 +803,9 @@ def _acquire_new_orb_sandbox(
 
     # 2. Boot from shared Amp project snapshot (ORB_SNAPSHOT_ID) when available.
     if config.snapshots_enabled and job.orb_snapshot_id:
-        mapped_ckpt, snap_mode = store.get_project_snapshot_entry(job.orb_snapshot_id)
+        mapped_ckpt, snap_mode = store.get_project_snapshot_entry(
+            job.orb_snapshot_id, team_id=spec.team_id
+        )
         if mapped_ckpt:
             if project_standby_touch_fn is not None and spec.gpu_count == 0:
                 project_standby_touch_fn(job.orb_snapshot_id, spec)
@@ -776,13 +828,18 @@ def _acquire_new_orb_sandbox(
                     )
                     mapped_ckpt = durable.id
                     snap_mode = "disk"
-                    store.set_project_snapshot(job.orb_snapshot_id, mapped_ckpt, mode="disk")
+                    store.set_project_snapshot(
+                        job.orb_snapshot_id,
+                        mapped_ckpt,
+                        mode="disk",
+                        team_id=spec.team_id,
+                    )
                 except (APIError, RuntimeError, TimeoutError) as exc:
                     log(
                         f"Project snapshot {job.orb_snapshot_id} upload did not complete ({exc}); "
                         "falling back to base image"
                     )
-                    store.remove_project_snapshot(job.orb_snapshot_id)
+                    store.remove_project_snapshot(job.orb_snapshot_id, team_id=spec.team_id)
                     mapped_ckpt = None
 
         if mapped_ckpt:
@@ -810,9 +867,11 @@ def _acquire_new_orb_sandbox(
                     f"Project snapshot {job.orb_snapshot_id} restore failed ({exc}); "
                     "pruning and falling back"
                 )
-                store.remove_project_snapshot(job.orb_snapshot_id)
+                store.remove_project_snapshot(job.orb_snapshot_id, team_id=spec.team_id)
 
-    resolved_image = resolve_prime_image(spec.image, image_client, deadline=deadline)
+    resolved_image = resolve_prime_image(
+        spec.image, image_client, deadline=deadline, team_id=spec.team_id
+    )
 
     # 3. Claim a pre-placed RUNNING/PAUSED VM from the daemon's base standby pool.
     if standby_claim_fn is not None and spec.gpu_count == 0:
@@ -987,14 +1046,17 @@ def build_warm_template(
             "GPU orb types cannot build memory-fork templates (Prime cannot pause GPUs)"
         )
 
-    resolved_image = resolve_prime_image(spec.image, image_client, deadline=deadline)
+    resolved_image = resolve_prime_image(
+        spec.image, image_client, deadline=deadline, team_id=spec.team_id
+    )
     key = warm_template_key(resolved_image, spec)
     store = SnapshotStore(config.state_dir)
 
     template_name = f"amp-orb-template-{int(time.time())}"
     log_fn(
         f"Booting clean template VM ({spec.cpu_cores:g} vCPU, {spec.memory_gb:g} GiB RAM, "
-        f"{spec.disk_size_gb:g} GiB disk) from {resolved_image} ..."
+        f"{spec.disk_size_gb:g} GiB disk, scope={scope_label(spec.team_id)}) "
+        f"from {resolved_image} ..."
     )
     template_spec = replace(spec, timeout_minutes=30, idle_timeout_minutes=None)
     created = sandbox_client.create(
@@ -1007,6 +1069,7 @@ def build_warm_template(
             disk_size_gb=template_spec.disk_size_gb,
             timeout_minutes=30,
             region=template_spec.region,
+            team_id=template_spec.team_id,
             labels=[ORB_TEMPLATE_LABEL],
         )
     )
@@ -1081,6 +1144,9 @@ def _record_project_snapshot_from_checkpoint(
     log: LogFn,
     on_snapshot_saved: SnapshotSavedFn | None,
 ) -> None:
+    effective_team = (
+        sandbox.team_id or store.get_orb_team(sandbox.name) or config.default_spec.team_id
+    )
     snap_spec = replace(
         config.default_spec,
         cpu_cores=sandbox.cpu_cores,
@@ -1089,8 +1155,11 @@ def _record_project_snapshot_from_checkpoint(
         gpu_count=sandbox.gpu_count,
         gpu_type=sandbox.gpu_type,
         region=sandbox.region,
+        team_id=effective_team,
     )
-    existing_ckpt, existing_mode = store.get_project_snapshot_entry(orb_snapshot_id)
+    existing_ckpt, existing_mode = store.get_project_snapshot_entry(
+        orb_snapshot_id, team_id=effective_team
+    )
     if existing_ckpt and existing_mode != "uploading" and _get_durable_checkpoint_id(
         client, existing_ckpt
     ):
@@ -1101,7 +1170,9 @@ def _record_project_snapshot_from_checkpoint(
     # Under DispatchDaemon (`on_snapshot_saved` provided), return from `pause` immediately
     # so Amp's mid-setup `pause -> spawn` cycle never stalls on object-storage upload!
     if on_snapshot_saved is not None and sandbox.gpu_count == 0:
-        previous = store.set_project_snapshot(orb_snapshot_id, checkpoint_id, mode="uploading")
+        previous = store.set_project_snapshot(
+            orb_snapshot_id, checkpoint_id, mode="uploading", team_id=effective_team
+        )
         if (
             previous
             and previous != checkpoint_id
@@ -1118,7 +1189,9 @@ def _record_project_snapshot_from_checkpoint(
     durable = client.wait_for_checkpoint(
         checkpoint_id, timeout_seconds=_remaining(deadline, floor=5.0)
     )
-    previous = store.set_project_snapshot(orb_snapshot_id, durable.id, mode="disk")
+    previous = store.set_project_snapshot(
+        orb_snapshot_id, durable.id, mode="disk", team_id=effective_team
+    )
     if previous and previous != durable.id and previous not in store.referenced_checkpoint_ids():
         _safe_delete_checkpoint(client, previous, deadline)
     log(f"Saved project snapshot {orb_snapshot_id} -> checkpoint {durable.id}")
@@ -1136,7 +1209,12 @@ def _handle_pause(
     on_snapshot_saved: SnapshotSavedFn | None = None,
 ) -> None:
     sandbox, _ = _resolve_existing_orb_sandbox(
-        client, store, job.orb_id, log, authoritative_index=authoritative_index
+        client,
+        store,
+        job.orb_id,
+        log,
+        team_id=config.default_spec.team_id,
+        authoritative_index=authoritative_index,
     )
     if sandbox is None:
         log(f"No active sandbox for {job.orb_id}; pause is a no-op")
@@ -1147,8 +1225,13 @@ def _handle_pause(
 
     want_snapshot = bool(config.snapshots_enabled and job.orb_snapshot_id)
 
+    effective_team = (
+        sandbox.team_id or store.get_orb_team(job.orb_id) or config.default_spec.team_id
+    )
     if sandbox.status == "PAUSED":
-        store.set_orb_sandbox(job.orb_id, sandbox.id, status="PAUSED")
+        store.set_orb_sandbox(
+            job.orb_id, sandbox.id, status="PAUSED", team_id=effective_team
+        )
         if want_snapshot and job.orb_snapshot_id:
             ckpt_id = store.get_orb_checkpoint(job.orb_id)
             if not ckpt_id:
@@ -1179,6 +1262,7 @@ def _handle_pause(
             sandbox=sandbox,
             orb_id=job.orb_id,
             orb_snapshot_id=job.orb_snapshot_id if want_snapshot else None,
+            team_id=effective_team,
             deadline=deadline,
             log=log,
         )
@@ -1209,7 +1293,9 @@ def _handle_pause(
         store.set_orb_checkpoint(job.orb_id, pause_ckpt_id)
 
     _poll_until_paused(client, sandbox.id, paused.error_message, deadline)
-    store.set_orb_sandbox(job.orb_id, sandbox.id, status="PAUSED")
+    store.set_orb_sandbox(
+        job.orb_id, sandbox.id, status="PAUSED", team_id=effective_team
+    )
     log(f"Paused sandbox {sandbox.id} for {job.orb_id}")
 
     if want_snapshot and job.orb_snapshot_id:
@@ -1246,6 +1332,7 @@ def _checkpoint_and_delete_for_pause(
     sandbox: Sandbox,
     orb_id: str,
     orb_snapshot_id: str | None,
+    team_id: str | None,
     deadline: float,
     log: LogFn,
 ) -> None:
@@ -1255,7 +1342,9 @@ def _checkpoint_and_delete_for_pause(
     )
     store.set_orb_checkpoint(orb_id, durable.id)
     if orb_snapshot_id:
-        store.set_project_snapshot(orb_snapshot_id, durable.id, mode="disk")
+        store.set_project_snapshot(
+            orb_snapshot_id, durable.id, mode="disk", team_id=team_id
+        )
     store.remove_orb_sandbox(orb_id)
     _safe_delete_sandbox(client, sandbox.id)
     log(f"Checkpointed ({durable.id}) and terminated non-pausable sandbox {sandbox.id}")
@@ -1268,42 +1357,46 @@ def expire_stale_project_snapshots(
     ttl_seconds: int | None,
     log_fn: LogFn = default_log,
 ) -> int:
-    """Delete project snapshot checkpoints older than `ttl_seconds` (including memory-promoted)."""
+    """Delete project snapshot checkpoints older than `ttl_seconds` across all scopes."""
     if not ttl_seconds or ttl_seconds <= 0:
         return 0
     now = datetime.now(UTC)
     expired = 0
     deadline = time.monotonic() + 60.0
-    modes = store.all_project_snapshot_modes()
+    modes = store.all_project_snapshot_modes(all_scopes=True)
 
-    for snap_id, ckpt_id in list(store.all_project_snapshots().items()):
-        if modes.get(snap_id) == "uploading":
+    for raw_key, ckpt_id in list(store.all_project_snapshots(all_scopes=True).items()):
+        if modes.get(raw_key) == "uploading":
             continue
         try:
             ckpt = client.get_checkpoint(ckpt_id)
         except APIError:
-            store.remove_project_snapshot(snap_id)
+            store.remove_raw_project_snapshot_key(raw_key)
             expired += 1
             continue
 
         age = (now - _aware_utc(ckpt.created_at)).total_seconds()
         if ckpt.state != "DURABLE" or ckpt.merge == "failed" or age >= ttl_seconds:
-            store.remove_project_snapshot(snap_id)
+            store.remove_raw_project_snapshot_key(raw_key)
             if ckpt_id not in store.referenced_checkpoint_ids():
                 _safe_delete_checkpoint(client, ckpt_id, deadline)
-            log_fn(f"Expired project snapshot {snap_id} (checkpoint {ckpt_id}, age={int(age)}s)")
+            log_fn(f"Expired project snapshot {raw_key} (checkpoint {ckpt_id}, age={int(age)}s)")
             expired += 1
     return expired
 
 
 def _handle_delete(
     job: DispatchJob,
+    config: ProviderConfig,
     client: SandboxClient,
     store: SnapshotStore,
     deadline: float,
     log: LogFn,
 ) -> None:
-    active, terminated = list_sandboxes_for_orb(client, job.orb_id)
+    effective_team = store.get_orb_team(job.orb_id) or config.default_spec.team_id
+    active, terminated = list_sandboxes_for_orb(
+        client, job.orb_id, team_id=effective_team
+    )
     cached_id = store.get_orb_sandbox(job.orb_id)
     known_ids = {s.id for s in active} | {s.id for s in terminated}
     if cached_id and cached_id not in known_ids:

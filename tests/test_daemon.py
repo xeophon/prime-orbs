@@ -547,15 +547,19 @@ def test_tuned_transport_pools_proactive_token_refresh_and_setup_timings(
             str(unit_dir),
             "--standby-count",
             "1",
+            "--team-id",
+            "team_alpha",
             "--no-enable",
         ]
     )
     assert rc == 0
     assert (env_file.stat().st_mode & 0o777) == 0o600
+    env_text = env_file.read_text(encoding="utf-8")
+    assert "PRIME_TEAM_ID=team_alpha" in env_text
     svc_text = (unit_dir / "prime-orbs.service").read_text(encoding="utf-8")
     refresh_svc = (unit_dir / "prime-orbs-refresh.service").read_text(encoding="utf-8")
     refresh_timer = (unit_dir / "prime-orbs-refresh.timer").read_text(encoding="utf-8")
-    assert "run --warm-template --standby-count 1" in svc_text
-    assert "warm-template" in refresh_svc
+    assert "run --warm-template --team-id team_alpha --standby-count 1" in svc_text
+    assert "warm-template --team-id team_alpha" in refresh_svc
     assert "OnCalendar=" in refresh_timer
 

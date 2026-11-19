@@ -60,6 +60,8 @@ def render_systemd_units(
     unit_dir: Path,
     service_name: str = "prime-orbs",
     standby_count: int | None = None,
+    team_id: str | None = None,
+    force_personal: bool = False,
     include_refresh_timer: bool = True,
     refresh_on_calendar: str = DEFAULT_REFRESH_ON_CALENDAR,
 ) -> SystemdUnits:
@@ -68,10 +70,18 @@ def render_systemd_units(
     unit_dir = unit_dir.expanduser().resolve()
 
     base_cmd = _resolve_prime_orbs_command(repo_root)
-    run_args = ["run", "--warm-template"]
+    scope_args: list[str] = []
+    if force_personal:
+        scope_args.append("--personal")
+    elif team_id:
+        scope_args.extend(["--team-id", shlex.quote(team_id)])
+
+    run_args = ["run", "--warm-template", *scope_args]
     if standby_count is not None:
         run_args.extend(["--standby-count", str(standby_count)])
     exec_run = f"{base_cmd} {' '.join(run_args)}"
+    warm_args = ["warm-template", *scope_args]
+    exec_warm = f"{base_cmd} {' '.join(warm_args)}"
     path_env = _service_path_env()
 
     service_content = (
@@ -117,7 +127,7 @@ def render_systemd_units(
         f"WorkingDirectory={repo_root}\n"
         f"EnvironmentFile={env_file}\n"
         f'Environment="PATH={path_env}"\n'
-        f"ExecStart={base_cmd} warm-template\n"
+        f"ExecStart={exec_warm}\n"
     )
     refresh_timer_content = (
         "[Unit]\n"
@@ -143,7 +153,12 @@ def render_systemd_units(
     )
 
 
-def ensure_env_file_placeholder(env_file: Path) -> bool:
+def ensure_env_file_placeholder(
+    env_file: Path,
+    *,
+    team_id: str | None = None,
+    force_personal: bool = False,
+) -> bool:
     """Ensure `env_file` exists with mode 0600. Returns True if a new placeholder was created."""
     env_file = env_file.expanduser()
     if env_file.exists():
@@ -151,11 +166,17 @@ def ensure_env_file_placeholder(env_file: Path) -> bool:
         return False
     env_file.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(env_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    team_line = (
+        'PRIME_TEAM_ID=""\n'
+        if force_personal
+        else (f"PRIME_TEAM_ID={team_id}\n" if team_id else "# PRIME_TEAM_ID=\n")
+    )
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(
             "# Prime Orbs credentials (mode 0600)\n"
             "PRIME_API_KEY=\n"
             "AMP_ORB_PROVIDER_TOKEN=\n"
+            f"{team_line}"
         )
     return True
 

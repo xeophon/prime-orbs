@@ -29,6 +29,16 @@ OrbOperation = Literal["spawn", "pause", "delete"]
 OrbArch = Literal["amd64", "arm64"]
 
 
+def scope_label(team_id: str | None) -> str:
+    """Return canonical scope label (`'personal'` or `'team:<id>'`)."""
+    return f"team:{team_id}" if team_id else "personal"
+
+
+def sdk_team_param(team_id: str | None) -> str:
+    """Return explicit team query/filter argument for Prime SDK calls (`''` forces personal)."""
+    return team_id if team_id else ""
+
+
 @dataclass(frozen=True)
 class OrbSpec:
     """Resource and runtime parameters for a Prime Sandbox orb."""
@@ -43,10 +53,14 @@ class OrbSpec:
     timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES
     idle_timeout_minutes: int | None = None
     region: str | None = None
+    team_id: str | None = None
     network_allowlist: list[str] | None = None
     network_denylist: list[str] | None = None
 
     def __post_init__(self) -> None:
+        if self.team_id is not None:
+            cleaned_team = self.team_id.strip() or None
+            object.__setattr__(self, "team_id", cleaned_team)
         if not self.image or not self.image.strip():
             raise ValueError("Orb image must be non-empty")
         if self.arch not in (None, "amd64", "arm64"):
@@ -180,6 +194,9 @@ class ProviderConfig:
         idle_timeout_raw = _optional_str(env.get("PRIME_ORB_IDLE_TIMEOUT_MINUTES"))
         idle_timeout_minutes = int(idle_timeout_raw) if idle_timeout_raw is not None else None
         region = _optional_str(env.get("PRIME_ORB_REGION"))
+        team_id = _resolve_default_team_id(
+            env, use_prime_config_file=(environ is None or "HOME" in env)
+        )
         allowlist = _parse_csv(env.get("PRIME_ORB_NETWORK_ALLOWLIST"))
         denylist = _parse_csv(env.get("PRIME_ORB_NETWORK_DENYLIST"))
 
@@ -194,6 +211,7 @@ class ProviderConfig:
             timeout_minutes=timeout_minutes,
             idle_timeout_minutes=idle_timeout_minutes,
             region=region,
+            team_id=team_id,
             network_allowlist=allowlist,
             network_denylist=denylist,
         )
@@ -299,6 +317,49 @@ def _optional_str(value: str | None) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _resolve_default_team_id(
+    env: Mapping[str, str], *, use_prime_config_file: bool = True
+) -> str | None:
+    """Resolve Prime team scope: PRIME_ORB_TEAM_ID > PRIME_TEAM_ID > ~/.prime/config.json.
+
+    An explicitly empty PRIME_ORB_TEAM_ID="" or PRIME_TEAM_ID="" forces personal scope
+    even when ~/.prime/config.json has a team_id configured.
+    """
+    for key in ("PRIME_ORB_TEAM_ID", "PRIME_TEAM_ID"):
+        if key in env:
+            return _optional_str(env.get(key))
+
+    if not use_prime_config_file:
+        return None
+
+    context = _optional_str(env.get("PRIME_CONTEXT"))
+    if context and context.casefold() == "production":
+        return None
+
+    home_raw = _optional_str(env.get("HOME"))
+    home = Path(home_raw).expanduser() if home_raw else Path.home()
+    prime_dir = home / ".prime"
+    if context:
+        ctx_file = prime_dir / "environments" / f"{context}.json"
+        if ctx_file.is_file():
+            try:
+                ctx_data = json.loads(ctx_file.read_text(encoding="utf-8"))
+                if isinstance(ctx_data, dict) and "team_id" in ctx_data:
+                    return _optional_str(str(ctx_data["team_id"]) if ctx_data["team_id"] else None)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    cfg_file = prime_dir / "config.json"
+    if cfg_file.is_file():
+        try:
+            cfg_data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(cfg_data, dict) and cfg_data.get("team_id"):
+                return _optional_str(str(cfg_data["team_id"]))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return None
 
 
 def _parse_arch(value: str | None) -> OrbArch | None:

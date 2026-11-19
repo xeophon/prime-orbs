@@ -23,7 +23,7 @@ from prime_sandboxes import (
 )
 from prime_sandboxes.image_references import is_docker_hub_reference
 
-from .config import DEFAULT_AMP_ORB_IMAGE_ARM64, DEFAULT_AMP_ORB_IMAGE_X64, OrbArch
+from .config import DEFAULT_AMP_ORB_IMAGE_ARM64, DEFAULT_AMP_ORB_IMAGE_X64, OrbArch, sdk_team_param
 
 _IN_PROGRESS_BUILD_STATUSES = {
     ImageBuildStatus.PENDING,
@@ -91,7 +91,9 @@ def find_latest_image_row(
     team_id: str | None = None,
 ) -> ImageListItem | None:
     """Find the most recent Prime Image artifact row matching `image_name:image_tag`."""
-    listed = image_client.list(search=image_name, team_id=team_id, limit=100)
+    listed = image_client.list(
+        search=image_name, team_id=sdk_team_param(team_id), limit=100
+    )
     matches = [
         row
         for row in listed.data
@@ -119,9 +121,7 @@ def resolve_prime_image(
     if is_directly_bootable_image(requested_image):
         return requested_image.strip()
 
-    cache_scope = team_id or getattr(
-        getattr(getattr(image_client, "client", None), "config", None), "team_id", None
-    )
+    cache_scope = team_id or "personal"
     cache_key = (cache_scope, requested_image.strip())
     now = time.monotonic()
     with _IMAGE_CACHE_LOCK:
@@ -169,13 +169,15 @@ def resolve_prime_image(
         break
 
     arch_flag = " --arch arm64" if "arm64" in requested_image.lower() else ""
+    team_flag = f" --team-id {team_id}" if team_id else ""
+    owner_hint = "<team-slug>" if team_id else "<owner>"
     raise ImageResolutionError(
         f"Prime Sandboxes cannot boot external registry image {requested_image!r} directly. "
         f"Build it once in Prime Images first:\n"
         f"  uv run prime-orbs build-image --base-image {requested_image}"
-        f" --name {image_name}:{image_tag}{arch_flag}\n"
+        f" --name {image_name}:{image_tag}{arch_flag}{team_flag}\n"
         f"Once built, either keep default ORB_IMAGE (auto-resolved by name) or set "
-        f"PRIME_ORB_IMAGE=prime/<owner>/{image_name}:{image_tag}."
+        f"PRIME_ORB_IMAGE=prime/{owner_hint}/{image_name}:{image_tag}."
     )
 
 
@@ -259,7 +261,12 @@ def build_orb_image(
     platform: Literal["linux/amd64", "linux/arm64"] = (
         "linux/arm64" if arch == "arm64" else "linux/amd64"
     )
-    resolved_team_id = team_id if team_id is not None else image_client.client.config.team_id
+    resolved_team_id = (
+        team_id
+        if team_id is not None
+        else getattr(getattr(image_client, "client", None), "config", None)
+        and image_client.client.config.team_id
+    )
     request = BuildImageRequest(
         image_name=image_name,
         image_tag=image_tag,

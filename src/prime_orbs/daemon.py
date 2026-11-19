@@ -89,7 +89,12 @@ class DispatchDaemon:
             self.socket_path.unlink()
 
         try:
-            sync_known_orbs(self.sandbox_client, self._store, log_fn=default_log)
+            sync_known_orbs(
+                self.sandbox_client,
+                self._store,
+                team_id=self._base_config.default_spec.team_id,
+                log_fn=default_log,
+            )
             self._authoritative_index = True
         except Exception as exc:
             default_log(f"Warning: initial orb index sync failed ({exc}); using label fallback")
@@ -133,13 +138,16 @@ class DispatchDaemon:
                     same_state_dir = (
                         config.state_dir.resolve() == daemon._base_config.state_dir.resolve()
                     )
+                    same_scope = same_state_dir and (
+                        config.default_spec.team_id == daemon._base_config.default_spec.team_id
+                    )
                     run_dispatch(
                         job,
                         config,
                         sandbox_client=daemon.sandbox_client,
                         image_client=daemon.image_client,
                         log_fn=log_fn,
-                        authoritative_index=daemon._authoritative_index and same_state_dir,
+                        authoritative_index=daemon._authoritative_index and same_scope,
                         standby_claim_fn=daemon.standby_pool.claim if same_state_dir else None,
                         project_standby_claim_fn=(
                             daemon.standby_pool.claim_project if same_state_dir else None

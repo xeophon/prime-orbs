@@ -173,3 +173,63 @@ class TestProviderConfigPrecedence:
         )
         with pytest.raises(ValueError, match="Unknown ORB_TYPE='nonexistent'"):
             cfg.resolve_spec(unknown_job)
+
+    def test_team_scope_precedence_and_explicit_personal_override(self, tmp_path: Path) -> None:
+        prime_dir = tmp_path / ".prime"
+        prime_dir.mkdir()
+        (prime_dir / "config.json").write_text(
+            json.dumps({"team_id": "team_from_file"}), encoding="utf-8"
+        )
+
+        # 1. Reads ~/.prime/config.json when PRIME_TEAM_ID is absent
+        from_file = ProviderConfig.from_env(
+            {"HOME": str(tmp_path), "PRIME_ORB_STATE_DIR": str(tmp_path / "s")}
+        )
+        assert from_file.default_spec.team_id == "team_from_file"
+
+        # 2. Explicit empty PRIME_TEAM_ID="" forces personal scope (None, never "")
+        forced_personal = ProviderConfig.from_env(
+            {
+                "HOME": str(tmp_path),
+                "PRIME_TEAM_ID": "",
+                "PRIME_ORB_STATE_DIR": str(tmp_path / "s"),
+            }
+        )
+        assert forced_personal.default_spec.team_id is None
+
+        # 3. PRIME_ORB_TEAM_ID overrides PRIME_TEAM_ID, and ORB_TYPE can override team_id per size
+        mixed_env = {
+            "HOME": str(tmp_path),
+            "PRIME_TEAM_ID": "team_env",
+            "PRIME_ORB_TEAM_ID": "team_orb",
+            "PRIME_ORB_TYPES": json.dumps(
+                {
+                    "personal-small": {"cpu_cores": 2, "team_id": None},
+                    "gpu-team": {"cpu_cores": 8, "team_id": "team_gpu"},
+                }
+            ),
+            "PRIME_ORB_STATE_DIR": str(tmp_path / "s"),
+        }
+        mixed_cfg = ProviderConfig.from_env(mixed_env)
+        assert mixed_cfg.default_spec.team_id == "team_orb"
+
+        p_job = DispatchJob.from_env(
+            {
+                "ORB_OPERATION": "spawn",
+                "ORB_ID": "amp-p",
+                "ORB_TOKEN": "t",
+                "ORB_TYPE": "personal-small",
+            }
+        )
+        assert mixed_cfg.resolve_spec(p_job).team_id is None
+
+        g_job = DispatchJob.from_env(
+            {
+                "ORB_OPERATION": "spawn",
+                "ORB_ID": "amp-g",
+                "ORB_TOKEN": "t",
+                "ORB_TYPE": "gpu-team",
+            }
+        )
+        assert mixed_cfg.resolve_spec(g_job).team_id == "team_gpu"
+
