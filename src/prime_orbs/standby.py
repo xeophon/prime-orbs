@@ -24,9 +24,9 @@ from .dispatcher import (
     TEMPLATE_PREWARM_SCRIPT,
     TERMINAL_STATUSES,
     LogFn,
+    _await_new_sandbox_for_bootstrap,
     _execute_when_gateway_ready,
     _poll_until_paused,
-    _poll_until_running,
     _prefetch_gateway_auth_async,
     _safe_delete_checkpoint,
     _safe_delete_sandbox,
@@ -39,6 +39,7 @@ from .dispatcher import (
 )
 from .images import resolve_prime_image
 from .state import SnapshotStore
+from .transport import prewarm_api_connection, prewarm_gateway_transport
 
 ORB_STANDBY_LABEL = "amp-orb-standby"
 
@@ -59,12 +60,14 @@ class SnapshotPromoter:
         *,
         log_fn: LogFn = default_log,
         on_promoted: Callable[[str, OrbSpec], None] | None = None,
+        on_standby_ready: Callable[[str, OrbSpec, Sandbox], bool] | None = None,
     ) -> None:
         self._config = config
         self._client = sandbox_client
         self._store = store
         self._log = log_fn
         self._on_promoted = on_promoted
+        self._on_standby_ready = on_standby_ready
         self._lock = threading.Lock()
         self._inflight: set[str] = set()
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="prime-snap-warm")
@@ -110,7 +113,20 @@ class SnapshotPromoter:
             )
 
             # Step 2: Boot a clean VM from that disk checkpoint, warm `amp` in RAM, and pause it.
-            temp_name = f"amp-snap-warm-{int(time.time())}"
+            # When the standby pool wants a standby for this project snapshot, label and size it as
+            # a reusable standby VM so it can be adopted directly (skipping a second VM boot!).
+            adoptable = self._on_standby_ready is not None
+            proj_key = project_standby_key(orb_snapshot_id, spec)
+            temp_name = (
+                f"amp-proj-standby-{int(time.time())}"
+                if adoptable
+                else f"amp-snap-warm-{int(time.time())}"
+            )
+            vm_labels = (
+                [ORB_STANDBY_LABEL, standby_key_label(proj_key)]
+                if adoptable
+                else [ORB_TEMPLATE_LABEL]
+            )
             self._log(
                 f"Promoting project snapshot {orb_snapshot_id} ({disk_checkpoint_id}, "
                 f"scope={scope_label(spec.team_id)}) to a bootable memory checkpoint ..."
@@ -121,14 +137,18 @@ class SnapshotPromoter:
                     checkpoint_id=disk_checkpoint_id,
                     cpu_cores=spec.cpu_cores,
                     memory_gb=spec.memory_gb,
-                    timeout_minutes=30,
+                    timeout_minutes=spec.timeout_minutes if adoptable else 30,
+                    idle_timeout_minutes=spec.idle_timeout_minutes if adoptable else None,
                     region=spec.region,
                     team_id=spec.team_id,
-                    labels=[ORB_TEMPLATE_LABEL],
+                    network_allowlist=spec.network_allowlist if adoptable else None,
+                    network_denylist=spec.network_denylist if adoptable else None,
+                    labels=vm_labels,
                 )
             )
+            adopted = False
             try:
-                _poll_until_running(self._client, created, deadline)
+                _await_new_sandbox_for_bootstrap(self._client, created, deadline)
                 _execute_when_gateway_ready(
                     self._client,
                     created.id,
@@ -143,18 +163,24 @@ class SnapshotPromoter:
                 durable = self._client.wait_for_checkpoint(
                     paused.checkpoint_id, timeout_seconds=max(10.0, deadline - time.monotonic())
                 )
+                self._store.set_project_snapshot(
+                    orb_snapshot_id, durable.id, mode=target_mode, team_id=spec.team_id
+                )
+                if self._on_standby_ready is not None:
+                    with contextlib.suppress(Exception):
+                        paused_sbx = self._client.get(created.id)
+                        adopted = bool(self._on_standby_ready(orb_snapshot_id, spec, paused_sbx))
             finally:
-                _safe_delete_sandbox(self._client, created.id)
+                if not adopted:
+                    _safe_delete_sandbox(self._client, created.id)
 
-            self._store.set_project_snapshot(
-                orb_snapshot_id, durable.id, mode=target_mode, team_id=spec.team_id
-            )
             if disk_checkpoint_id not in self._store.referenced_checkpoint_ids():
                 _safe_delete_checkpoint(self._client, disk_checkpoint_id, deadline)
             self._log(
                 f"Promoted project snapshot {orb_snapshot_id} -> memory checkpoint {durable.id}"
+                + (f" (adopted standby {created.id})" if adopted else "")
             )
-            if self._on_promoted is not None:
+            if not adopted and self._on_promoted is not None:
                 self._on_promoted(orb_snapshot_id, spec)
             return durable.id
         except Exception as exc:
@@ -207,6 +233,11 @@ class StandbyPool:
         self._default_key: str | None = None
         self._default_image: str | None = None
         self._thread: threading.Thread | None = None
+        self._replenish_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="prime-standby-replenish"
+        )
+        self._last_snapshot_gc = 0.0
+        self._last_api_keepalive = 0.0
 
     def start(self, *, run_background_worker: bool = True) -> None:
         resolved_image = resolve_prime_image(
@@ -244,6 +275,60 @@ class StandbyPool:
             self._log(f"Draining LRU-evicted project standby sandbox {sbx_id}")
             _safe_delete_sandbox(self._client, sbx_id)
 
+    def adopt_project_standby(
+        self, orb_snapshot_id: str, spec: OrbSpec, sandbox: Sandbox
+    ) -> bool:
+        """Adopt a freshly promoted PAUSED/RUNNING VM directly into the project standby bucket.
+
+        If the pool is currently hot (recent activity) and the VM is PAUSED, resumes it in the
+        background or synchronously so the next thread claims it in a single RPC.
+        Returns True when the pool took ownership (caller must not delete `sandbox`).
+        """
+        if self._max_project_standbys <= 0 or spec.gpu_count > 0:
+            return False
+        if sandbox.status not in ("RUNNING", "PAUSED"):
+            return False
+
+        key = project_standby_key(orb_snapshot_id, spec)
+        evicted_ids: list[str] = []
+        status = sandbox.status
+        if status == "PAUSED" and not self._is_idle():
+            resumed = _speculative_resume_until_running(
+                self._client, sandbox.id, time.monotonic() + 120.0, self._log
+            )
+            if resumed is not None and resumed.status == "RUNNING":
+                status = "RUNNING"
+                prewarm_gateway_transport(self._client, sandbox.id)
+
+        with self._lock:
+            if self._stop_event.is_set():
+                return False
+            self._last_activity = time.monotonic()
+            self._project_targets.pop(key, None)
+            self._project_targets[key] = (orb_snapshot_id, spec)
+            while len(self._project_targets) > self._max_project_standbys:
+                evicted_key, _ = self._project_targets.popitem(last=False)
+                for sbx_id, _ in self._pool.pop(evicted_key, ()):
+                    evicted_ids.append(sbx_id)
+                self._store.set_standby_ids(evicted_key, [])
+
+            bucket = self._pool.setdefault(key, [])
+            if any(sid == sandbox.id for sid, _ in bucket) or len(bucket) >= 1:
+                adopted = False
+            else:
+                if status == "RUNNING":
+                    bucket.insert(0, (sandbox.id, "RUNNING"))
+                else:
+                    bucket.append((sandbox.id, "PAUSED"))
+                self._store.set_standby_ids(key, [sid for sid, _ in bucket])
+                adopted = True
+            self._wake_event.set()
+
+        for sbx_id in evicted_ids:
+            self._log(f"Draining LRU-evicted project standby sandbox {sbx_id}")
+            _safe_delete_sandbox(self._client, sbx_id)
+        return adopted
+
     def reconcile(self) -> None:
         """Re-adopt live base & project standby VMs across restarts; drain stale/excess ones."""
         default_team = self._config.default_spec.team_id
@@ -253,7 +338,7 @@ class StandbyPool:
         persisted = self._store.all_standby_ids()
         discovered_by_id: dict[str, Sandbox] = {}
 
-        for key, ids in persisted.items():
+        for key in persisted:
             if (
                 key.startswith("snap:")
                 and key.endswith(expected_scope_suffix)
@@ -262,16 +347,12 @@ class StandbyPool:
                 snap_part = key.split("|", 1)[0].removeprefix("snap:")
                 if snap_part in valid_snapshots:
                     self._project_targets[key] = (snap_part, self._config.default_spec)
-            for sbx_id in ids:
-                if sbx_id in claimed_orb_ids:
-                    continue
-                with contextlib.suppress(APIError):
-                    sbx = self._client.get(sbx_id)
-                    if sbx.status not in TERMINAL_STATUSES:
-                        discovered_by_id[sbx.id] = sbx
 
+        # List standby sandboxes first so persisted IDs already returned in the list page
+        # skip individual GET /sandbox/{id} round-trips on daemon startup!
         cursor: str | None = None
         seen_cursors: set[str] = set()
+        listed_ids: set[str] = set()
         with contextlib.suppress(APIError):
             while True:
                 page = self._client.list(
@@ -281,12 +362,22 @@ class StandbyPool:
                     cursor=cursor,
                 )
                 for sbx in page.sandboxes:
+                    listed_ids.add(sbx.id)
                     if sbx.id not in claimed_orb_ids and sbx.status not in TERMINAL_STATUSES:
                         discovered_by_id[sbx.id] = sbx
                 if not page.has_next or not page.next_cursor or page.next_cursor in seen_cursors:
                     break
                 seen_cursors.add(page.next_cursor)
                 cursor = page.next_cursor
+
+        for ids in persisted.values():
+            for sbx_id in ids:
+                if sbx_id in claimed_orb_ids or sbx_id in listed_ids:
+                    continue
+                with contextlib.suppress(APIError):
+                    sbx = self._client.get(sbx_id)
+                    if sbx.status not in TERMINAL_STATUSES:
+                        discovered_by_id[sbx.id] = sbx
 
         allowed_quotas: dict[str, int] = {}
         if self._target_count > 0 and self._default_key:
@@ -321,6 +412,15 @@ class StandbyPool:
                 if items:
                     self._pool[key] = [(s.id, s.status) for s in items]
                 self._store.set_standby_ids(key, [s.id for s in items])
+            running_reconciled = [
+                sid
+                for items in self._pool.values()
+                for sid, st in items
+                if st == "RUNNING"
+            ]
+
+        for sbx_id in running_reconciled:
+            _prefetch_gateway_auth_async(self._client, sbx_id)
 
         for sbx_id in to_delete:
             self._log(f"Draining unneeded standby sandbox {sbx_id}")
@@ -385,8 +485,12 @@ class StandbyPool:
         target = self._pick_next_replenish_target()
         if target is None:
             return None
-        key, orb_snapshot_id, spec = target
+        return self._run_replenish_target(target)
 
+    def _run_replenish_target(
+        self, target: tuple[str, str | None, OrbSpec]
+    ) -> Sandbox | None:
+        key, orb_snapshot_id, spec = target
         try:
             if orb_snapshot_id is not None:
                 sbx = self._create_project_standby(key, orb_snapshot_id, spec)
@@ -473,26 +577,49 @@ class StandbyPool:
         """Pause any RUNNING standby VMs if the pool has been idle past `standby_hot_seconds`."""
         if not self._is_idle():
             return 0
-        with self._lock:
-            candidates = [
-                (key, sid)
-                for key, items in self._pool.items()
-                for sid, st in items
-                if st == "RUNNING"
-            ]
         cooled = 0
-        for key, sbx_id in candidates:
+        while self._is_idle():
+            # Pop the candidate out of the pool before pausing so a concurrent spawn can never
+            # claim a VM that is in the middle of being paused!
+            with self._lock:
+                picked: tuple[str, str] | None = None
+                for key, items in self._pool.items():
+                    for idx, (sid, st) in enumerate(items):
+                        if st == "RUNNING":
+                            items.pop(idx)
+                            picked = (key, sid)
+                            break
+                    if picked is not None:
+                        break
+            if picked is None:
+                break
+
+            key, sbx_id = picked
+            final_status: str | None = None
             with contextlib.suppress(APIError):
                 sbx = self._client.get(sbx_id)
                 if sbx.status == "RUNNING" and self._cool_standby(sbx) is not None:
-                    self._mark_bucket_status(key, sbx_id, "PAUSED")
+                    final_status = "PAUSED"
                     cooled += 1
-                elif sbx.status == "PAUSED":
-                    self._mark_bucket_status(key, sbx_id, "PAUSED")
+                elif sbx.status in ("RUNNING", "PAUSED"):
+                    final_status = sbx.status
+
+            if final_status is not None:
+                with self._lock:
+                    bucket = self._pool.setdefault(key, [])
+                    if final_status == "RUNNING":
+                        bucket.insert(0, (sbx_id, "RUNNING"))
+                    else:
+                        bucket.append((sbx_id, "PAUSED"))
+                    self._store.set_standby_ids(key, [sid for sid, _ in bucket])
+            else:
+                with self._lock:
+                    bucket = self._pool.get(key, [])
+                    self._store.set_standby_ids(key, [sid for sid, _ in bucket])
         return cooled
 
     def refresh_standby_tokens_now(self) -> int:
-        """Keep RUNNING standby `gatewayAuth` tokens warm across 30-minute expiry boundaries."""
+        """Keep RUNNING standby `gatewayAuth` tokens & HTTP/2 connections warm."""
         auth_cache = getattr(self._client, "_auth_cache", None)
         get_or_refresh = getattr(auth_cache, "get_or_refresh", None)
         if not callable(get_or_refresh):
@@ -507,18 +634,20 @@ class StandbyPool:
         refreshed = 0
         for sbx_id in running_ids:
             with contextlib.suppress(Exception):
-                get_or_refresh(sbx_id)
+                if not prewarm_gateway_transport(self._client, sbx_id):
+                    get_or_refresh(sbx_id)
                 refreshed += 1
         return refreshed
 
-    def _mark_bucket_status(self, key: str, sbx_id: str, new_status: str) -> None:
+    def touch_activity(self) -> None:
+        """Record recent provider activity and wake the standby worker to pre-warm paused VMs."""
         with self._lock:
-            bucket = self._pool.get(key)
-            if not bucket:
-                return
-            self._pool[key] = [
-                (sid, new_status if sid == sbx_id else st) for sid, st in bucket
-            ]
+            self._last_activity = time.monotonic()
+            has_paused = any(
+                st == "PAUSED" for items in self._pool.values() for _, st in items
+            )
+            if has_paused:
+                self._wake_event.set()
 
     def _is_idle(self) -> bool:
         with self._lock:
@@ -538,6 +667,7 @@ class StandbyPool:
         )
 
         created: Sandbox | None = None
+        from_memory_fork = False
         if warm_ckpt:
             try:
                 created = self._client.create(
@@ -554,6 +684,7 @@ class StandbyPool:
                         labels=labels,
                     )
                 )
+                from_memory_fork = True
             except APIError:
                 self._store.remove_warm_template(key)
                 created = None
@@ -577,7 +708,12 @@ class StandbyPool:
                 )
             )
 
-        return self._finalize_standby_vm(created, deadline, f"base standby {created.id}")
+        return self._finalize_standby_vm(
+            created,
+            deadline,
+            f"base standby {created.id}",
+            skip_prewarm=from_memory_fork,
+        )
 
     def _create_project_standby(
         self, key: str, orb_snapshot_id: str, spec: OrbSpec
@@ -627,25 +763,47 @@ class StandbyPool:
             return None
 
         return self._finalize_standby_vm(
-            created, deadline, f"project standby ({orb_snapshot_id}) {created.id}"
+            created,
+            deadline,
+            f"project standby ({orb_snapshot_id}) {created.id}",
+            skip_prewarm=use_memory,
         )
 
     def _finalize_standby_vm(
-        self, created: Sandbox, deadline: float, label: str
+        self,
+        created: Sandbox,
+        deadline: float,
+        label: str,
+        *,
+        skip_prewarm: bool = False,
     ) -> Sandbox | None:
         try:
-            running = _poll_until_running(self._client, created, deadline)
-            _execute_when_gateway_ready(
-                self._client,
-                running.id,
-                TEMPLATE_PREWARM_SCRIPT,
-                envs={"PRIME_ORB_UPDATE_AMP": "0"},
-                user=self._config.orb_user,
-                deadline=deadline,
-                action_label="standby prewarm",
-            )
+            running = _await_new_sandbox_for_bootstrap(self._client, created, deadline)
+            if skip_prewarm:
+                # Memory-forked standbys already have guest RAM/page cache warmed from the
+                # template or promoted snapshot; run only a tiny readiness probe to verify the
+                # guest gateway is reachable and warm the HTTP/2 connection pool.
+                _execute_when_gateway_ready(
+                    self._client,
+                    running.id,
+                    "true",
+                    envs=None,
+                    user=self._config.orb_user,
+                    deadline=deadline,
+                    action_label="standby readiness probe",
+                )
+            else:
+                _execute_when_gateway_ready(
+                    self._client,
+                    running.id,
+                    TEMPLATE_PREWARM_SCRIPT,
+                    envs={"PRIME_ORB_UPDATE_AMP": "0"},
+                    user=self._config.orb_user,
+                    deadline=deadline,
+                    action_label="standby prewarm",
+                )
             self._log(f"Prepared warm {label}")
-            return running
+            return running.model_copy(update={"status": "RUNNING"})
         except Exception as exc:
             self._log(f"Warning: failed to prepare {label}: {exc}")
             _safe_delete_sandbox(self._client, created.id)
@@ -662,18 +820,87 @@ class StandbyPool:
             self._log(f"Warning: could not auto-pause standby sandbox {sandbox.id}: {exc}")
             return None
 
+    def _replenish_batch(self) -> bool:
+        """Create up to 2 missing standby VMs concurrently; return True if any succeeded."""
+        if self._target_count <= 0:
+            return False
+        targets: list[tuple[str, str | None, OrbSpec]] = []
+        while not self._stop_event.is_set() and len(targets) < 2:
+            target = self._pick_next_replenish_target()
+            if target is None:
+                break
+            targets.append(target)
+        if not targets:
+            return False
+        if len(targets) == 1:
+            return self._run_replenish_target(targets[0]) is not None
+        futures = [self._replenish_executor.submit(self._run_replenish_target, t) for t in targets]
+        any_created = False
+        for fut in futures:
+            with contextlib.suppress(Exception):
+                if fut.result() is not None:
+                    any_created = True
+        return any_created
+
+    def _resume_reconciled_standbys(self) -> None:
+        """Warm PAUSED standbys back to RUNNING while the pool is within its hot window."""
+        if self._is_idle():
+            return
+        while not self._stop_event.is_set() and not self._is_idle():
+            # Pop the candidate out of the pool while resuming so a concurrent spawn never races
+            # a duplicate POST /resume against the same standby VM.
+            with self._lock:
+                picked: tuple[str, str] | None = None
+                for key, items in self._pool.items():
+                    for idx, (sid, st) in enumerate(items):
+                        if st == "PAUSED":
+                            items.pop(idx)
+                            picked = (key, sid)
+                            break
+                    if picked is not None:
+                        break
+            if picked is None:
+                break
+
+            key, sbx_id = picked
+            _prefetch_gateway_auth_async(self._client, sbx_id)
+            resumed = _speculative_resume_until_running(
+                self._client, sbx_id, time.monotonic() + 120.0, self._log
+            )
+            if resumed is not None and resumed.status == "RUNNING":
+                prewarm_gateway_transport(self._client, sbx_id)
+                with self._lock:
+                    bucket = self._pool.setdefault(key, [])
+                    bucket.insert(0, (sbx_id, "RUNNING"))
+                    self._store.set_standby_ids(key, [sid for sid, _ in bucket])
+                self._log(f"Pre-warmed paused standby sandbox {sbx_id} to RUNNING")
+            else:
+                with self._lock:
+                    bucket = self._pool.get(key, [])
+                    self._store.set_standby_ids(key, [sid for sid, _ in bucket])
+                _safe_delete_sandbox(self._client, sbx_id)
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
                 while not self._stop_event.is_set():
-                    created = self.replenish_once()
-                    if created is None:
+                    if not self._replenish_batch():
                         break
                 if not self._stop_event.is_set():
-                    self.cool_idle_now()
+                    if self._is_idle():
+                        self.cool_idle_now()
+                    else:
+                        self._resume_reconciled_standbys()
                 if not self._stop_event.is_set():
                     self.refresh_standby_tokens_now()
-                if not self._stop_event.is_set():
+                now = time.monotonic()
+                if not self._stop_event.is_set() and (now - self._last_api_keepalive) >= 60.0:
+                    self._last_api_keepalive = now
+                    api_client = getattr(self._client, "client", None)
+                    if api_client is not None:
+                        prewarm_api_connection(api_client)
+                if not self._stop_event.is_set() and (now - self._last_snapshot_gc) >= 300.0:
+                    self._last_snapshot_gc = now
                     expire_stale_project_snapshots(
                         self._client,
                         self._store,
@@ -693,3 +920,4 @@ class StandbyPool:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        self._replenish_executor.shutdown(wait=False, cancel_futures=True)

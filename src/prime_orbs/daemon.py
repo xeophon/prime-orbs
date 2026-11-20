@@ -78,6 +78,12 @@ class DispatchDaemon:
             self._store,
             log_fn=default_log,
             on_promoted=self.standby_pool.register_project_snapshot,
+            on_standby_ready=(
+                self.standby_pool.adopt_project_standby
+                if self._base_config.standby_count > 0
+                and self._base_config.max_project_standbys > 0
+                else None
+            ),
         )
         self._authoritative_index = False
         self._server: _ThreadingUnixStreamServer | None = None
@@ -87,6 +93,18 @@ class DispatchDaemon:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(OSError):
             self.socket_path.unlink()
+
+        # Keep `dispatch` startup crisp: warm the Prime API socket and reconcile index + standbys.
+        api_client = getattr(self.sandbox_client, "client", None)
+        if api_client is not None:
+            from .transport import prewarm_api_connection
+
+            threading.Thread(
+                target=prewarm_api_connection,
+                args=(api_client,),
+                name="prime-api-prewarm",
+                daemon=True,
+            ).start()
 
         try:
             sync_known_orbs(
@@ -141,6 +159,8 @@ class DispatchDaemon:
                     same_scope = same_state_dir and (
                         config.default_spec.team_id == daemon._base_config.default_spec.team_id
                     )
+                    if same_state_dir and job.operation == "spawn":
+                        daemon.standby_pool.touch_activity()
                     run_dispatch(
                         job,
                         config,

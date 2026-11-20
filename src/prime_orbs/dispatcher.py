@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover
 from .config import DispatchJob, OrbSpec, ProviderConfig, scope_label, sdk_team_param
 from .images import resolve_prime_image
 from .state import SnapshotStore, orb_lock
-from .transport import create_tuned_clients
+from .transport import create_tuned_clients, prewarm_gateway_transport
 
 ORB_MANAGED_LABEL = "amp-orb"
 ORB_TEMPLATE_LABEL = "amp-orb-template"
@@ -68,8 +68,20 @@ mkdir -p "${HOME}/.config/amp"
 if [ "${PRIME_ORB_UPDATE_AMP:-1}" = "1" ] && command -v amp >/dev/null 2>&1; then
   amp update --porcelain || true
 fi
-if command -v amp >/dev/null 2>&1; then
-  amp orb bootstrap --version >/dev/null 2>&1 || amp --version >/dev/null 2>&1 || true
+host="$(hostname 2>/dev/null || true)"
+if [ -n "$host" ] && ! getent hosts "$host" >/dev/null 2>&1; then
+  if [ -w /etc/hosts ]; then
+    printf '127.0.0.1 %s\n' "$host" >> /etc/hosts || true
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -n sh -c 'printf "127.0.0.1 %s\n" "$1" >> /etc/hosts' _ "$host" >/dev/null 2>&1 || true
+  fi
+fi
+amp_bin="$(command -v amp 2>/dev/null || true)"
+if [ -n "$amp_bin" ]; then
+  # Fault the full ~150MB single-file amp binary into guest RAM/page cache so memory-forked
+  # and standby VMs skip cold virtio-blk reads when bootstrap and headless launch amp.
+  cat "$amp_bin" >/dev/null 2>&1 || true
+  "$amp_bin" orb bootstrap --version >/dev/null 2>&1 || "$amp_bin" --version >/dev/null 2>&1 || true
 fi
 getent ahosts ampcode.com tunnel.ampcode.com static.ampcode.com >/dev/null 2>&1 || true
 rm -f "${HOME}/.amp-bootstrap.log"
@@ -130,7 +142,9 @@ def _remaining(deadline: float, *, floor: float = 0.25) -> float:
 
 
 def _fast_poll_delay(elapsed: float) -> float:
-    """Poll tightly (250ms) during normal 1-15s boot/resume/pause windows, then ease off."""
+    """Poll tightly during short boot/resume/pause windows, then ease off."""
+    if elapsed < 3.0:
+        return 0.15
     if elapsed < 15.0:
         return 0.25
     if elapsed < 45.0:
@@ -152,7 +166,7 @@ def _invalidate_gateway_auth(client: SandboxClient, sandbox_id: str) -> None:
 
 
 def _prefetch_gateway_auth_async(client: SandboxClient, sandbox_id: str) -> None:
-    """Refresh an expired gateway auth token concurrently while a paused VM resumes."""
+    """Refresh gateway auth and warm the gateway HTTP/2 TLS pool concurrently during boot/resume."""
     auth_cache = getattr(client, "_auth_cache", None)
     get_or_refresh = getattr(auth_cache, "get_or_refresh", None)
     if not callable(get_or_refresh):
@@ -160,7 +174,8 @@ def _prefetch_gateway_auth_async(client: SandboxClient, sandbox_id: str) -> None
 
     def _worker() -> None:
         with contextlib.suppress(Exception):
-            get_or_refresh(sandbox_id)
+            if not prewarm_gateway_transport(client, sandbox_id):
+                get_or_refresh(sandbox_id)
 
     threading.Thread(
         target=_worker, name=f"prime-auth-prefetch-{sandbox_id[:12]}", daemon=True
@@ -169,6 +184,28 @@ def _prefetch_gateway_auth_async(client: SandboxClient, sandbox_id: str) -> None
 
 def _is_waiting_for_image_build(sandbox: Sandbox) -> bool:
     return sandbox.status == "PENDING" and bool(getattr(sandbox, "pending_image_build_id", None))
+
+
+def _has_cached_gateway_auth(client: SandboxClient, sandbox_id: str) -> bool:
+    """Return True when `client` already holds a live `gatewayAuth` token for `sandbox_id`."""
+    auth_cache = getattr(client, "_auth_cache", None)
+    raw_map = getattr(auth_cache, "_auth_cache", None)
+    return isinstance(raw_map, dict) and sandbox_id in raw_map
+
+
+def _await_new_sandbox_for_bootstrap(
+    client: SandboxClient,
+    created: Sandbox,
+    deadline: float,
+) -> Sandbox:
+    """Return `created` immediately when `gatewayAuth` is already seeded and no image build
+    is pending, so `_launch_bootstrap_when_ready` hits the low-latency HTTP/2 gateway directly
+    instead of paying serialized `GET /sandbox/{id}` control-plane round-trips first."""
+    if created.status == "RUNNING":
+        return created
+    if _has_cached_gateway_auth(client, created.id) and not _is_waiting_for_image_build(created):
+        return created
+    return _poll_until_running(client, created, deadline)
 
 
 def _is_retryable_bootstrap_error(exc: BaseException) -> bool:
@@ -197,14 +234,8 @@ def sync_known_orbs(
     states: dict[str, str] = {}
     teams: dict[str, str | None] = {}
 
-    for orb_id, sbx_id in store.all_orb_sandboxes().items():
-        with contextlib.suppress(APIError):
-            sbx = client.get(sbx_id)
-            if sbx.status not in TERMINAL_STATUSES:
-                reconciled[orb_id] = sbx.id
-                states[orb_id] = sbx.status
-                teams[orb_id] = sbx.team_id or store.get_orb_team(orb_id)
-
+    stored_orbs = store.all_orb_sandboxes()
+    listed_by_id: dict[str, Sandbox] = {}
     by_orb: dict[str, list[Sandbox]] = {}
     cursor: str | None = None
     seen_cursors: set[str] = set()
@@ -216,6 +247,7 @@ def sync_known_orbs(
             cursor=cursor,
         )
         for sbx in page.sandboxes:
+            listed_by_id[sbx.id] = sbx
             if sbx.status in TERMINAL_STATUSES:
                 continue
             orb_id = _extract_orb_id_from_labels(sbx)
@@ -225,6 +257,19 @@ def sync_known_orbs(
             break
         seen_cursors.add(page.next_cursor)
         cursor = page.next_cursor
+
+    for orb_id, sbx_id in stored_orbs.items():
+        if sbx_id in listed_by_id:
+            sbx = listed_by_id[sbx_id]
+        else:
+            try:
+                sbx = client.get(sbx_id)
+            except APIError:
+                continue
+        if sbx.status not in TERMINAL_STATUSES:
+            reconciled[orb_id] = sbx.id
+            states[orb_id] = sbx.status
+            teams[orb_id] = sbx.team_id or store.get_orb_team(orb_id)
 
     for orb_id, items in by_orb.items():
         items.sort(key=lambda s: _aware_utc(s.created_at), reverse=True)
@@ -397,7 +442,9 @@ def _handle_spawn(
     # Fast speculative wake path: when local state knows this orb is PAUSED, fire POST /resume
     # immediately on ms 0 (skipping a preceding GET /sandbox/{id}) while prefetching gateway auth!
     cached_id, cached_state = store.get_orb_sandbox_with_state(job.orb_id)
+    needs_reconcile = True
     if cached_id and cached_state == "PAUSED":
+        needs_reconcile = False
         log(f"Speculatively resuming paused sandbox {cached_id} for {job.orb_id}")
         _prefetch_gateway_auth_async(client, cached_id)
         resumed = _speculative_resume_until_running(client, cached_id, deadline, log)
@@ -416,7 +463,34 @@ def _handle_spawn(
                 dead = client.get(cached_id)
                 if dead.status in TERMINAL_STATUSES:
                     terminated.append(dead)
-    else:
+    elif cached_id and cached_state == "RUNNING":
+        # Fast optimistic re-bootstrap path: skip GET /sandbox/{id} when local state knows this
+        # orb is already RUNNING (e.g., retry or reconnect). Falls back on SandboxNotRunningError.
+        try:
+            boot_started = time.monotonic()
+            _launch_bootstrap_when_ready(
+                client,
+                cached_id,
+                job,
+                config,
+                deadline,
+                log,
+                fast_fail_if_dead=True,
+            )
+            boot_ms = int((time.monotonic() - boot_started) * 1000)
+            total_ms = int((time.monotonic() - spawn_started) * 1000)
+            log(
+                f"Spawn ready for {job.orb_id} on {cached_id} via optimistic-running "
+                f"(acquire=0ms, bootstrap={boot_ms}ms, total={total_ms}ms)"
+            )
+            return
+        except SandboxNotRunningError as exc:
+            log(
+                f"Optimistic RUNNING sandbox {cached_id} for {job.orb_id} was not running "
+                f"({exc}); reconciling status"
+            )
+
+    if needs_reconcile:
         candidate, found_terminated = _resolve_existing_orb_sandbox(
             client,
             store,
@@ -578,6 +652,7 @@ def _poll_until_running(
     if initial.status == "RUNNING":
         return initial
 
+    _prefetch_gateway_auth_async(client, initial.id)
     started = time.monotonic()
     while True:
         remaining = _remaining(deadline)
@@ -796,7 +871,11 @@ def _acquire_new_orb_sandbox(
                     checkpoint_id=recovery_ckpt,
                 )
             )
-            return _poll_until_running(client, created, deadline).id, False, "checkpoint-recovery"
+            return (
+                _await_new_sandbox_for_bootstrap(client, created, deadline).id,
+                False,
+                "checkpoint-recovery",
+            )
         except APIError as exc:
             log(f"Orb checkpoint {recovery_ckpt} restore failed ({exc}); falling back")
             store.remove_orb_checkpoint(job.orb_id)
@@ -861,7 +940,7 @@ def _acquire_new_orb_sandbox(
                     )
                 )
                 src = "project-snapshot-memory" if use_memory else "project-snapshot-disk"
-                return _poll_until_running(client, created, deadline).id, False, src
+                return _await_new_sandbox_for_bootstrap(client, created, deadline).id, False, src
             except APIError as exc:
                 log(
                     f"Project snapshot {job.orb_snapshot_id} restore failed ({exc}); "
@@ -897,7 +976,11 @@ def _acquire_new_orb_sandbox(
                         restore_memory=True,
                     )
                 )
-                return _poll_until_running(client, created, deadline).id, False, "warm-template"
+                return (
+                    _await_new_sandbox_for_bootstrap(client, created, deadline).id,
+                    False,
+                    "warm-template",
+                )
             except APIError as exc:
                 log(
                     f"Warm memory checkpoint {warm_ckpt} fork failed ({exc}); "
@@ -919,7 +1002,7 @@ def _acquire_new_orb_sandbox(
             docker_image=resolved_image,
         )
     )
-    return _poll_until_running(client, created, deadline).id, False, "cold-image"
+    return _await_new_sandbox_for_bootstrap(client, created, deadline).id, False, "cold-image"
 
 
 def _execute_when_gateway_ready(
@@ -937,6 +1020,7 @@ def _execute_when_gateway_ready(
     started = time.monotonic()
     last_error: BaseException | None = None
     attempt = 0
+    next_status_check = started + 2.5
 
     while True:
         remaining = _remaining(deadline)
@@ -962,11 +1046,25 @@ def _execute_when_gateway_ready(
                 raise
             last_error = exc
             attempt += 1
-            if (deadline - time.monotonic()) <= 0.25:
+            now = time.monotonic()
+            if (deadline - now) <= 0.25:
                 break
-            check_threshold = 1 if fast_fail_if_dead else 2
-            if attempt >= check_threshold:
+            exc_lower = str(exc).lower()
+            is_auth_err = any(
+                marker in exc_lower
+                for marker in ("unauthenticated", "401", "unauthorized", "invalid token")
+            )
+            is_placement_wait = "being placed on a node" in exc_lower
+            if is_auth_err:
                 _invalidate_gateway_auth(client, sandbox_id)
+
+            should_check_status = fast_fail_if_dead or (
+                attempt >= 2 and (not is_placement_wait or now >= next_status_check)
+            )
+            if should_check_status:
+                if not is_auth_err and not is_placement_wait and attempt >= 4:
+                    _invalidate_gateway_auth(client, sandbox_id)
+                next_status_check = now + 2.5
                 try:
                     sbx = client.get(sandbox_id)
                 except APIError as get_exc:
@@ -987,7 +1085,14 @@ def _execute_when_gateway_ready(
                                 f"{sbx.error_message or sbx.termination_reason or 'no details'}"
                             ),
                         ) from exc
-            delay = _fast_poll_delay(time.monotonic() - started)
+                    if _is_waiting_for_image_build(sbx):
+                        time.sleep(min(5.0, _remaining(deadline)))
+                        continue
+            delay = (
+                0.1
+                if is_placement_wait and (now - started) < 5.0
+                else _fast_poll_delay(now - started)
+            )
             time.sleep(min(delay, _remaining(deadline)))
 
     assert last_error is not None
@@ -1031,6 +1136,7 @@ def build_warm_template(
     update_amp_cli: bool = True,
     timeout_seconds: float = 600.0,
     log_fn: LogFn = default_log,
+    keep_standby_label: str | None = None,
 ) -> tuple[str, str]:
     """Boot a clean orb VM, prewarm `amp` in guest RAM, and store its pause checkpoint."""
     deadline = time.monotonic() + timeout_seconds
@@ -1058,23 +1164,31 @@ def build_warm_template(
         f"{spec.disk_size_gb:g} GiB disk, scope={scope_label(spec.team_id)}) "
         f"from {resolved_image} ..."
     )
-    template_spec = replace(spec, timeout_minutes=30, idle_timeout_minutes=None)
+    adopt_standby = keep_standby_label is not None
+    template_spec = (
+        spec if adopt_standby else replace(spec, timeout_minutes=30, idle_timeout_minutes=None)
+    )
+    labels = ["amp-orb-standby", keep_standby_label] if adopt_standby else [ORB_TEMPLATE_LABEL]
     created = sandbox_client.create(
         CreateSandboxRequest(
-            name=template_name,
+            name=f"amp-orb-standby-{int(time.time())}" if adopt_standby else template_name,
             docker_image=resolved_image,
             arch=template_spec.arch,
             cpu_cores=template_spec.cpu_cores,
             memory_gb=template_spec.memory_gb,
             disk_size_gb=template_spec.disk_size_gb,
-            timeout_minutes=30,
+            timeout_minutes=template_spec.timeout_minutes,
+            idle_timeout_minutes=template_spec.idle_timeout_minutes,
             region=template_spec.region,
             team_id=template_spec.team_id,
-            labels=[ORB_TEMPLATE_LABEL],
+            network_allowlist=template_spec.network_allowlist if adopt_standby else None,
+            network_denylist=template_spec.network_denylist if adopt_standby else None,
+            labels=labels,
         )
     )
+    succeeded = False
     try:
-        _poll_until_running(sandbox_client, created, deadline)
+        _await_new_sandbox_for_bootstrap(sandbox_client, created, deadline)
         log_fn(f"Prewarming Amp CLI inside template VM {created.id} ...")
         _execute_when_gateway_ready(
             sandbox_client,
@@ -1092,9 +1206,11 @@ def build_warm_template(
         durable = sandbox_client.wait_for_checkpoint(
             paused.checkpoint_id, timeout_seconds=_remaining(deadline, floor=5.0)
         )
+        succeeded = True
     finally:
-        with contextlib.suppress(APIError):
-            sandbox_client.delete(created.id)
+        if not (adopt_standby and succeeded):
+            with contextlib.suppress(APIError):
+                sandbox_client.delete(created.id)
 
     previous_ckpt = store.set_warm_template(key, durable.id)
     if previous_ckpt and previous_ckpt != durable.id and (
@@ -1102,7 +1218,12 @@ def build_warm_template(
     ):
         _safe_delete_checkpoint(sandbox_client, previous_ckpt, deadline)
 
-    log_fn(f"Saved warm memory checkpoint {durable.id} for {key}")
+    if adopt_standby and succeeded:
+        existing_standbys = store.get_standby_ids(key)
+        store.set_standby_ids(key, [*existing_standbys, created.id])
+        log_fn(f"Saved warm memory checkpoint {durable.id} and seeded standby {created.id}")
+    else:
+        log_fn(f"Saved warm memory checkpoint {durable.id} for {key}")
     return key, durable.id
 
 

@@ -37,7 +37,7 @@ from .images import (
     format_prime_image_ref,
     resolve_prime_image,
 )
-from .standby import ORB_STANDBY_LABEL
+from .standby import ORB_STANDBY_LABEL, standby_key_label
 from .state import SnapshotStore
 from .systemd import (
     DEFAULT_REFRESH_ON_CALENDAR,
@@ -361,10 +361,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 needs_build = True
         if needs_build and config.default_spec.gpu_count == 0:
             env_with_img = {**scoped_env, "ORB_IMAGE": resolved_image}
+            effective_standby_count = (
+                args.standby_count if args.standby_count is not None else config.standby_count
+            )
+            seed_standby = (not args.no_daemon) and effective_standby_count > 0
             build_warm_template(
                 ProviderConfig.from_env(env_with_img),
                 sandbox_client=sandbox_client,
                 image_client=image_client,
+                keep_standby_label=standby_key_label(key) if seed_standby else None,
             )
 
     env = dict(scoped_env)

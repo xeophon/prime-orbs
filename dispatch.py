@@ -2,22 +2,18 @@
 """Amp self-hosted orb dispatch entrypoint for Prime Intellect Sandboxes.
 
 When `prime-orbs run` is hosting its warm UNIX-socket daemon (`PRIME_ORBS_DAEMON_SOCKET`),
-this script forwards the job over the socket using only the Python standard library (~15ms,
-no SDK import or virtualenv re-exec). When invoked standalone (`amp orb provider ./dispatch.py`),
-it executes `prime_orbs` directly.
+this script forwards the job over the socket using only minimal Python standard library
+imports (~10ms, no SDK import, pathlib, shutil, or virtualenv re-exec). When invoked
+standalone (`amp orb provider ./dispatch.py`), it executes `prime_orbs` directly.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
 import sys
-from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent
-SRC_DIR = REPO_ROOT / "src"
 _FORWARDED_PREFIXES = ("ORB_", "PRIME_ORB_", "AMP_", "PRIME_", "XDG_")
 
 
@@ -48,8 +44,13 @@ def _try_daemon_fast_path() -> int | None:
 
 
 def _ensure_environment() -> None:
-    if str(SRC_DIR) not in sys.path:
-        sys.path.insert(0, str(SRC_DIR))
+    import shutil
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent
+    src_dir = repo_root / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
     try:
         import prime_sandboxes  # noqa: F401
         return
@@ -59,11 +60,11 @@ def _ensure_environment() -> None:
     if os.environ.get("_PRIME_ORBS_REEXEC") == "1":
         raise SystemExit(
             "prime-sandboxes is not installed. Run `uv sync` in "
-            f"{REPO_ROOT} before starting `amp orb provider`."
+            f"{repo_root} before starting `amp orb provider`."
         )
 
     env = dict(os.environ, _PRIME_ORBS_REEXEC="1")
-    venv_python = REPO_ROOT / ".venv" / "bin" / "python"
+    venv_python = repo_root / ".venv" / "bin" / "python"
     if venv_python.is_file():
         os.execve(str(venv_python), [str(venv_python), __file__, *sys.argv[1:]], env)
 
@@ -71,7 +72,7 @@ def _ensure_environment() -> None:
     if uv_bin:
         os.execve(
             uv_bin,
-            [uv_bin, "run", "--project", str(REPO_ROOT), "python", __file__, *sys.argv[1:]],
+            [uv_bin, "run", "--project", str(repo_root), "python", __file__, *sys.argv[1:]],
             env,
         )
 
